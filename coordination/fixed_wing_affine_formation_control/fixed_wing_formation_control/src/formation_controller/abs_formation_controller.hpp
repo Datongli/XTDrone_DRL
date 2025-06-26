@@ -39,7 +39,7 @@ public:
         float time_const{5.0}; //5.0   //***试过调为1.0 没有影响
     };
 
-    //***僚机控制律参数
+    //***控制律参数
     struct _s_control_law_params
     {
         /*无人机数量*/
@@ -75,6 +75,20 @@ public:
        
 
     };
+
+    //障碍物位置
+    struct _s_control_obstacle_avoidance
+    {
+        float obstacle_num=5;
+        float obstacle_pos[2][5]={
+            {1000,2000,1500,1600,1200},//x
+            {1000,1800,1200,1500,1300}//y
+        };
+        float obstacle_radius=50;//障碍物半径
+        float uav_radius=2;//无人机半径
+        float staticEdgeDistance=10;//静态安全距离
+    };
+
     //***roll_2_pitch和height_2_speed参数
     struct _s_compensate_state_params
     {
@@ -103,20 +117,27 @@ public:
 
     //***僚机偏移控制律
     void follower_control_law();
-    
+    //**避障算法 */
+    void obstacle_avoidance(float pos_x,float pos_y);
     //***将角度归到[-pi,pi)的区间内
     float RoundAngle(float ang);  
 
     void set_ID(int id); 
 
 private:
+    
+    float nowtime{0};
     /* 控制时间间隔 */
     float _dt{0.01};
     /* 控制时间间隔max */
     float _dtMax{0.1};
     /* 控制时间间隔min */
     float _dMin{0.01};
-
+    /*避障输出命令*/
+    float vel_cmd{0.0f};
+    float angular_rate_cmd{0.0f};
+    float is_avoid=false;//避障标志
+    
     //***编队控制器外函数，变量（组）
 
     /* 绝对速度位置控制器时间戳 */
@@ -194,6 +215,8 @@ private:
 
     //***控制律
     _s_control_law_params control_law_params;
+
+    _s_control_obstacle_avoidance obstacle_params;
     //***补偿
     _s_compensate_state_params state_params;
 

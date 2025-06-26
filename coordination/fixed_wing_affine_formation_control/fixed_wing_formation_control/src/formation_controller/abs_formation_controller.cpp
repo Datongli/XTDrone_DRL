@@ -48,6 +48,7 @@ void ABS_FORMATION_CONTROLLER::filter_fw_states()
   everyfw_states_f5 = everyfwstates5;
   its_neighbor_scurve[0] = itsneighbor_scurve0;
   its_neighbor_scurve[1] = itsneighbor_scurve1;
+  nowtime=currenttime;
   /* 最终传出量everyfw_states_f和fw_states_f */
 }
 /**
@@ -90,9 +91,52 @@ float ABS_FORMATION_CONTROLLER::RoundAngle(float ang)
 
   return ang1;
 }
+/**
+ * @brief z避障算法
+ * 
+ */
+void ABS_FORMATION_CONTROLLER::obstacle_avoidance(float pos_x,float pos_y)
+{
+  const float k=2;
+  is_avoid=false;//初始化避障标志
+  Vec f_obs_total;//排斥力汇总
+  f_obs_total.set_vec_ele(0.0f,0.0f);
+  /*角度关系*/
+  Vec havoid_1,havoid_2;
+  havoid_1.set_vec_ele(cosf(fw_states_f.yaw_angle),sinf(fw_states_f.yaw_angle));
+  havoid_2.set_vec_ele(-sinf(fw_states_f.yaw_angle),cosf(fw_states_f.yaw_angle));
+  /*位置、速度关系*/
+  Vec rel_pos,rel_pos_normalized;
+  float distance,closing_speed,safe_dist;
+  Vec uav_vel,rel_vel;
+  /*累积计算排斥力*/
+  for(int i=1;i<=obstacle_params.obstacle_num;i++)
+  {
+    
+    rel_pos.set_vec_ele(pos_x-obstacle_params.obstacle_pos[0][i],pos_y-obstacle_params.obstacle_pos[1][i]);//相对位移
+    distance=rel_pos.len();//与障碍物距离
+    rel_pos_normalized=rel_pos.operator/(distance + 1e-5) ;
+    //相对速度计算
+    uav_vel=fw_gspeed_2d;
+    rel_vel=uav_vel.operator-(0.0f);//相对速度
+    closing_speed=rel_vel.operator*(rel_pos_normalized);
+    if(closing_speed > 0)continue;//远离情况不考虑
 
-
-
+    safe_dist=obstacle_params.obstacle_radius+obstacle_params.uav_radius+obstacle_params.staticEdgeDistance+uav_vel.len()/fw_states_f.yaw_rate;
+    if(distance<=safe_dist){
+      float denominator;
+      is_avoid=true;
+      denominator=max(distance-obstacle_params.obstacle_radius,0.1);
+      Vec f_obs;
+      f_obs=rel_pos.operator*((safe_dist-distance)/denominator/distance);
+      f_obs_total=f_obs_total.operator+(f_obs);
+    }
+  }
+  if(is_avoid){
+    vel_cmd=sat_function(uav_vel.len()+havoid_1.operator*(f_obs_total),fw_params.vmin, fw_params.vmax);
+    angular_rate_cmd=sat_function(fw_states_f.yaw_rate+havoid_2.operator*(f_obs_total),-0.5, 0.5);
+  }
+}
 //*********************************************************************
 //***基于导航律的Unicycle模型的方法，这里期望速度直接用水平二维速度，事先飞到统一高度，再用TECS得到pitch与油门，roll根据偏航角速度，由BTT条件得到
 //***10.23;问题：当从机在主机前面的时候，从机减速，等待主机追过他去(前提是航向一致)，这影响了效果？
@@ -249,13 +293,16 @@ void ABS_FORMATION_CONTROLLER::control_law()
   double leader_inter{100}; /*相邻长机间隔x方向间隔*/
   double dis_inter{30};     /*相邻僚机间隔*/
   
+  if (nowtime > 350) leader_inter=50;
+
+ ABS_FORMATION_CONTROLLER_INFO("当前时间:"<< nowtime<<";"<<"leader_inter="<<leader_inter);
   /*三角形用于leader-follower仿真，对应multi_uav_sim_ba_6vtol.sh*/
-  
+
   //三角形，用于僚机编队跟踪长机整体仿真
   tarpos[0] = scurve / sqrtf(2);
-  if(planeID==0)tarpos[1] = scurve / sqrtf(2) + inity + leader_inter;
-  if(planeID==1)tarpos[1] = scurve / sqrtf(2) + inity ;
-  if(planeID==2)tarpos[1] = scurve / sqrtf(2) + inity + 2 * leader_inter;
+  if(planeID==0)tarpos[1] = scurve / sqrtf(2) + inity + leader_inter;//y0=x-200
+  if(planeID==1)tarpos[1] = scurve / sqrtf(2) + inity ;//y1=x-300
+  if(planeID==2)tarpos[1] = scurve / sqrtf(2) + inity + 2 * leader_inter;//y2=x-100
   tarpos[2] = PI / 4;
   //长机协同变量zeta计算
   for(int i=0;i<2;i++){                                             
@@ -263,10 +310,10 @@ void ABS_FORMATION_CONTROLLER::control_law()
     if(planeID==1)zeta = zeta - nb_scurve[i] + scurve;
     if(planeID==2)zeta = zeta - nb_scurve[i] + scurve + 2 * leader_inter / sqrt(2);
    }
-   
+
 
   /*一字形仅用于leader协同仿真，对应multi_uav_sim_ba_3vtol_leader.sh*/
-  /*注释从此处开始
+  /*注释从此处开始 
   //一字型，仅用于长机协同仿真
   tarpos[0] = scurve / sqrtf(2);
   tarpos[1] = scurve / sqrtf(2) + inity + planeID * leader_inter;
@@ -332,7 +379,7 @@ void ABS_FORMATION_CONTROLLER::control_law()
 
  fw_2D_vel = fw_gspeed_2d.len();  //***使用地速来表示当前速度 都要为正值
 
-  ABS_FORMATION_CONTROLLER_INFO("长机速度2D_vel= " << fw_2D_vel << ";" << "偏航角度yaw_rate= "<< fw_yaw_angle <<";");
+  ABS_FORMATION_CONTROLLER_INFO("长机速度2D_vel= " << fw_2D_vel << ";" << "偏航角度yaw_angle= "<< fw_yaw_angle <<";");
  //***发现问题：yaw_rate为0 已解决；
 
   
@@ -355,6 +402,14 @@ void ABS_FORMATION_CONTROLLER::control_law()
  
  /*把求得的虚拟目标点弧长赋值给_cmd*/
   _cmd.scurve = fw_sp.scurve;     /* 注意此处已经对_cmd中的scurve赋值 */
+
+  //避障控制 
+ obstacle_avoidance(leader_local[0],leader_local[1]);
+ if (is_avoid){
+    vel_2D_sp=vel_cmd;
+    angular_rate_sp=angular_rate_cmd;
+    ABS_FORMATION_CONTROLLER_INFO("碰撞规避长机速度2D_vel= " << vel_2D_sp << ";" << "角速度yaw_rate= "<< angular_rate_sp <<";");
+  }
 
  //#############################控制律输出量#######################################
  airspd_sp_prev = airspd_sp;  //***待定
@@ -787,6 +842,14 @@ void ABS_FORMATION_CONTROLLER::follower_control_law()
   //**速度限制条件 */
   vel_2D_sp=sat_function(vel_2D_sp, fw_params.vmin, fw_params.vmax);
   angular_rate_sp=sat_function(angular_rate_sp, -0.5, 0.5);
+
+  //避障控制
+  obstacle_avoidance(fw_local[0],fw_local[1]);
+  if (is_avoid){
+    vel_2D_sp=vel_cmd;
+    angular_rate_sp=angular_rate_cmd;
+    ABS_FORMATION_CONTROLLER_INFO("碰撞规避僚机速度2D_vel= " << vel_2D_sp << ";" << "角速度yaw_rate= "<< angular_rate_sp <<";");
+  }
 
   ABS_FORMATION_CONTROLLER_INFO("实际线速度2D_vel= " << vel_2D_sp << ";" << "实际角速度yaw_rate= "<< angular_rate_sp <<";");
 

@@ -83,10 +83,12 @@ void FORMATION_CONTROLLER::update_everyfw_states(const struct _s_fw_states *ever
  * @Output: void
  * @Description: 更新长和长机邻居状态飞行状态
  */
-void FORMATION_CONTROLLER::update_leaders_states(const float *itsneighborstates0,
+void FORMATION_CONTROLLER::update_leaders_states(float current_time,
+                                                 const float *itsneighborstates0,
                                                  const float *itsneighborstates1,
                                                  const struct _s_fw_states *thisfw_states)
-{ /* 使用指针，避免内存浪费 */
+{   currenttime=current_time;
+    /* 使用指针，避免内存浪费 */
     itsneighbor_scurve0 = *itsneighborstates0;
     itsneighbor_scurve1 = *itsneighborstates1;
     fw_states = *thisfw_states;

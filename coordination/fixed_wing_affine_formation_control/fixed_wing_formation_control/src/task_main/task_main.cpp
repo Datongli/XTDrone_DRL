@@ -356,7 +356,7 @@ void TASK_MAIN::control_formation()
        formation_controller.reset_formation_controller();
     }
     /* 更新长机和长机邻居状态 */
-    formation_controller.update_leaders_states(&itsneighbor_scurve0,&itsneighbor_scurve1,&thisfw_states);
+    formation_controller.update_leaders_states(current_time,&itsneighbor_scurve0,&itsneighbor_scurve1,&thisfw_states);
     
     /* 编队控制，使用导航律的方法 */
 

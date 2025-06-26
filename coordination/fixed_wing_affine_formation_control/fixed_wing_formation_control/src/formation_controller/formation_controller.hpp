@@ -29,7 +29,7 @@ public:
    int planeID{0};  //***设置飞机ID 用来确定编队的期望点
 
    int itsleaderID{0};         /* 无人机僚机的长机号 */
-
+   float currenttime{0};
    float itsneighbor_scurve0={0.0};/* 长机的邻居弧长参数 */
    float itsneighbor_scurve1={0.0};/* 长机的邻居弧长参数 */
     /* 飞机的动力学模型参数 */
@@ -268,7 +268,8 @@ public:
                                const struct _s_fw_states *everyfw_states5,
                                const struct _s_fw_states *thisfw_states);
     /*更新长机状态*/
-    void update_leaders_states(const float *itsneighborstates0,
+    void update_leaders_states(float current_time,
+                               const float *itsneighborstates0,
                                const float *itsneighborstates1,
                                const struct _s_fw_states *thisfw_states);
     /* 设定编队形状 */

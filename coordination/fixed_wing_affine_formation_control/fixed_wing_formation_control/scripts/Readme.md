@@ -1,7 +1,7 @@
 #### 概述
 
 1. 实现功能
-    控制固定翼无人机集群：长机路径跟随控制、僚机仿射编队跟踪、避障。
+    控制固定翼无人机集群：长机路径跟随、僚机仿射编队跟随、碰撞规避。
 2. 任务想定
     以控制6架无人机为例，Vehicle0、Vehicle1、vehicle2为长机、vehicle3、vehicle4、vehicle5为僚机
     目标曲线为y=x，起飞原点为纬度：47.3977419、经度：8.5455946（此原点根据QGC软件载入无人机默认位置设置）
@@ -13,8 +13,15 @@
     首先配置好相关依赖（CMakeLists）、在工作空间下catkin_make，编译完成后，直接bash在scripts文件夹下的multi_uav_sim_ba_6vtol.sh；
     并未写完全部都键盘控制指令,本仿真几乎不采用键盘控制，可以预先通过QGC规划好航线来执行起飞飞行轨迹；
     然后通过QGC实现Mission下的起飞，待无人机起飞到所需高度后，通过键盘输入切换到offboard模式
+    具体步骤：
+    1、~/QGroundControl.AppImage
+    2、另起终端
+        cd ~/catkin_ws/src/fixed_wing_formation_control/scripts
+        bash multi_uav_sim_ba_6vtol.sh
+
 5. 注意事项
     编译失败时，可以将include的头文件复制到devel/include/fixed_wing_formation_control;
+    如果Gazebo启动失败，可能是进程没完全关闭，通过killall gzserver；killall gzclient 两条指令关闭。
     QGC参数设置（每架无人机都需要设置）：
     (1).EKF2_AID_MASK:1选择使用GPS(此参数解决not ready问题)；
     (2).COM_RCL_EXCEPT:4选择offbord（此参数解决 No manual control stick input问题）;
@@ -28,7 +35,7 @@
     代码的消息订阅等部分有很多冗余设置，可以只选择自身需要的；
     此代码还有很多可以完善的地方，比如参数的设定直接通过结构体赋值来改变了，键盘控制部分还不完善，  
     所用的TECS源码也不是最接近XTDrone环境的，函数架构还能进一步精简等，后续有机会继续改进；
-    僚机跟踪控制代码读取邻居无人机的方式是逐个读取，可以考虑用数组方式简化代码，后续会考虑修改该问题；
+    僚机跟踪控制代码读取邻居无人机的方式是逐个读取，可以考虑用数组方式简化代码；
     若做完一次仿真，重新启动后遇到一些意想不到的问题，可以试试rosclean purge。
 
 #### bash及各个函数主要功能介绍

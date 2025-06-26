@@ -140,7 +140,7 @@ private:
     ABS_FORMATION_CONTROLLER formation_controller; /*调用abs编队控制器，在本cpp中命名为formation_controller*/
     string fw_col_mode_current{"MANUAL"};   /*当前模式*/
     string fw_col_mode_last{"MANUAL"};      /*上一时刻模式*/
-
+    
     struct ABS_FORMATION_CONTROLLER::_s_fw_model_params fw_params;         /*飞机模型参数*/
     struct ABS_FORMATION_CONTROLLER::_s_tecs_params tecs_params;           /*编队控制器内部TECS控制器参数*/
 
