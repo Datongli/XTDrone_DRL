@@ -12,7 +12,16 @@ set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} "/opt/ros/melodic/")
 
 # qt_build provides the qt cmake glue, roscpp the comms for a default talker
 find_package(catkin REQUIRED COMPONENTS qt_build roscpp rviz)
-include_directories(${catkin_INCLUDE_DIRS})
+
+
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+  include
+  ${ARMADILLO_INCLUDE_DIRS}
+)
+
+link_directories(${catkin_LIBRARY_DIRS})
+
 find_package(Qt5 REQUIRED Core Widgets Charts)
 include_directories(${Qt5_INCLUDE_DIRS})
 #include_directories(${Qt5Charts_INCLUDE_DIRS})
