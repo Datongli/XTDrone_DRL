@@ -144,15 +144,20 @@ catkin_package(
 ## Build ##
 ###########
 find_package(Armadillo REQUIRED)
-include_directories(${ARMADILLO_INCLUDE_DIRS})
+
 
 
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
-include_directories(include)
+
+
 include_directories(
   ${catkin_INCLUDE_DIRS}
+  include
+  ${ARMADILLO_INCLUDE_DIRS}
 )
+
+link_directories(${catkin_LIBRARY_DIRS})
 
 ## Declare a cpp library
 # add_library(irobot_msgs

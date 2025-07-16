@@ -32,7 +32,7 @@
           <collision>bumper_collision</collision>
         </contact>
         <plugin name="benchmarking_bumper" filename="libgazebo_ros_bumper.so">
-          <robotNamespace></robotNamespace>
+          <robotNamespace>$(arg namespace)</robotNamespace>
           <bumperTopicName>benchmarker/collision</bumperTopicName>
         </plugin>
       </sensor>

@@ -128,26 +128,19 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-#  INCLUDE_DIRS include
-#  LIBRARIES irobot_msgs
-#  CATKIN_DEPENDS geometry_msgs nav_msgs
-#  DEPENDS system_lib
+  CATKIN_DEPENDS roscpp sensor_msgs nav_msgs visualization_msgs quadrotor_msgs tf pose_utils
 )
 
 ###########
 ## Build ##
 ###########
 find_package(Armadillo REQUIRED)
-include_directories(${ARMADILLO_INCLUDE_DIRS})
-
-
-## Specify additional locations of header files
-## Your package locations should be listed before other locations
-include_directories(include)
 include_directories(
   ${catkin_INCLUDE_DIRS}
+  include
+  ${ARMADILLO_INCLUDE_DIRS}
 )
-
+link_directories(${catkin_LIBRARY_DIRS})
 ## Declare a cpp library
 # add_library(irobot_msgs
 #   src/${PROJECT_NAME}/irobot_msgs.cpp
@@ -163,8 +156,8 @@ add_executable(odom_visualization src/odom_visualization.cpp)
 ## Specify libraries to link a library or executable target against
 target_link_libraries(odom_visualization
    ${catkin_LIBRARIES}
-   ${ARMADILLO_LIBRARIES}
    pose_utils
+   ${ARMADILLO_LIBRARIES}
 )
 
 #############
