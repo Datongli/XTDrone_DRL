@@ -1,0 +1,21 @@
+<sdf version='1.6'>
+  <model name='cube'>
+    <static>true</static>
+    <link name='link'>
+      <collision name='collision'>
+        <geometry>
+          <box>
+            <size>{size_x} {size_y} {size_z}</size>
+          </box>
+        </geometry>
+      </collision>
+      <visual name='visual'>
+        <geometry>
+          <box>
+            <size>{size_x} {size_y} {size_z}</size>
+          </box>
+        </geometry>
+      </visual>
+    </link>
+  </model>
+</sdf>
