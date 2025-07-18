@@ -1,0 +1,7 @@
+<launch>
+<!--控制Gazobo UI是否开启的参数-->
+<arg name="gui" value="true"/>
+
+    <!--控制Gazebo开启-->
+    <include file="$(find env)/launch/empty_world.launch"/>
+</launch>

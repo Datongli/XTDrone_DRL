@@ -1,0 +1,50 @@
+<launch>
+    <!-- 统一使用官方参数名 -->
+    <arg name="paused" default="false"/>
+    <arg name="use_sim_time" default="true"/>
+    <arg name="extra_gazebo_args" default=""/>
+    <arg name="gui" default="true"/> <!-- 关键：将 "Gazebo_gui" 改为 "gui" -->
+    <arg name="recording" default="false"/>
+    <arg name="headless" default="false"/>
+    <arg name="debug" default="false"/>
+    <arg name="physics" default="ode"/>
+    <arg name="verbose" default="false"/>
+    <arg name="world_name" default="$(find env)/launch/XTDrone_DRL.world"/>
+    <!-- <arg name="world_name" default="$(find gazebo_ros)/worlds/empty.world"/> -->
+    <arg name="respawn_gazebo" default="false"/>
+    <arg name="use_clock_frequency" default="false"/>
+    <arg name="pub_clock_frequency" default="1000"/>
+
+    <!-- 设置 use_sim_time -->
+    <param name="/use_sim_time" value="$(arg use_sim_time)"/>
+
+    <!-- 重置环境变量（官方关键步骤）
+    <env name="GAZEBO_MODEL_PATH" value="" />
+    <env name="GAZEBO_RESOURCE_PATH" value="" />
+    <env name="GAZEBO_PLUGIN_PATH" value="" /> -->
+
+    <!-- 命令参数重构（官方逻辑） -->
+    <arg unless="$(arg paused)" name="command_arg1" value=""/>
+    <arg     if="$(arg paused)" name="command_arg1" value="-u"/>
+    <arg unless="$(arg recording)" name="command_arg2" value=""/>
+    <arg     if="$(arg recording)" name="command_arg2" value="-r"/>
+    <arg unless="$(arg verbose)" name="command_arg3" value=""/>
+    <arg     if="$(arg verbose)" name="command_arg3" value="--verbose"/>
+    <arg unless="$(arg debug)" name="script_type" value="gzserver"/>
+    <arg     if="$(arg debug)" name="script_type" value="debug"/>
+
+    <!-- 启动 Gazebo 服务器 -->
+    <group if="$(arg use_clock_frequency)">
+        <param name="gazebo/pub_clock_frequency" value="$(arg pub_clock_frequency)"/>
+    </group>
+    <node name="gazebo" pkg="gazebo_ros" type="$(arg script_type)" respawn="$(arg respawn_gazebo)" output="screen"
+        args="$(arg command_arg1) $(arg command_arg2) $(arg command_arg3)
+              --physics=$(arg physics)          
+              $(arg extra_gazebo_args)
+              $(arg world_name)" />              <!-- 关键：world_name 必须是最后一个参数 -->
+
+    <!-- 启动 Gazebo 客户端（使用正确的 gui 参数名） -->
+    <group if="$(arg gui)"> <!-- 关键：改为 gui -->
+        <node name="gazebo_gui" pkg="gazebo_ros" type="gzclient" respawn="false" output="screen"/>
+    </group>
+</launch>
