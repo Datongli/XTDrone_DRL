@@ -1,0 +1,23 @@
+defaults:
+  - _self_
+  - env
+  - uav
+
+# 训练设备
+device: "cuda:0"
+
+# launch文件地址
+launchFile: multi_uav_static_env.launch
+
+# 训练参数
+epochs: 1e5  # 训练轮数
+seed: 0  # 随机种子
+
+
+# wandb参数
+wandb:
+  project: XTDrone_DRL
+  name: navigation_training
+  entity: XTDrone-DRL-UAV-Navigation
+  mode: offline # online
+  run_id: kw9xf9k9
