@@ -14,3 +14,4 @@ DRL/build
 DRL/devel
 DRL/.catkin_tools
 DRL/logs
+*.png
