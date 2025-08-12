@@ -18,12 +18,13 @@ from env.scripts.target import Target
 from env.scripts.obstacle import Obstacle
 from visualization_msgs.msg import MarkerArray, Marker
 from gazebo_msgs.msg import ModelState
-from uav.scripts.uav import UAV
+from uav.scripts.uav import UAV, Position
 
 
 class StaticObstacleEnv(gym.Env):
     """静态障碍物环境"""
     def __init__(self, cfg) -> None:
+        self.cfg = cfg
         """初始化环境中参数"""
         # 长宽高
         self.length: int| float = cfg.env.length
@@ -76,6 +77,12 @@ class StaticObstacleEnv(gym.Env):
         发布目标点和无人机状态，传感器数据
         """
         super().reset()
+        """gazebo物理仿真继续运行"""
+        rospy.wait_for_service("/gazebo/unpause_physics")
+        try:
+            self.unpause()
+        except rospy.ServiceException as e:
+            rospy.logerr("取消暂停gazebo物理仿真失败: %s", e)
         """重置gazebo环境"""
         # 世界重置服务
         rospy.wait_for_service("/gazebo/reset_world")
@@ -99,20 +106,38 @@ class StaticObstacleEnv(gym.Env):
         self._target_generate()
         """生成静态障碍物"""
         self._static_obstacles_generate()
-        rospy.loginfo("环境重置完成")
+        rospy.loginfo("环境重置完成，开始进行无人机信息采集...")
+        """获取无人机和环境信息，暂停gazebo仿真"""
+        # 无人机信息采集
+        depthInformations, uavStates = self._uav_information_collection()  # 深度相机信息和相对距离偏航角等
+        uavInformations = (depthInformations, uavStates)  # 无人机组合信息
+        rospy.loginfo("无人机信息采集完成")
+        # 暂停gazebo物理仿真
+        try:
+            self.pause()
+        except rospy.ServiceException as e:
+            rospy.logerr("暂停gazebo物理仿真失败: %s", e)
+        return uavInformations
         
-
-    def step(self):
+    def step(self, actions: np.ndarray):
         """
-        一步模拟
+        一步模拟，并行执行
+        :param actions: 无人机的动作，每个无人机的动作包括：下一秒的三维动作，航向角
+        :return: 无人机的状态，无人机的目标点，奖励，是否结束
         """
+        """欲返回信息"""
+        nextStates = []  # 无人机的状态
+        rewards = []  # 奖励
+        """跳过状态为done的无人机"""
+        for uav in self.uavs:
+            if uav.done:
+                continue
+            """执行无人机动作"""
         pass
-
 
     def render(self):
         pass
 
-    
     def _world_adaption(self):
         """
         根据cfg中的参数，调整gazebo世界world文件的参数
@@ -192,7 +217,7 @@ class StaticObstacleEnv(gym.Env):
                     udpPort=24540+i,
                     gcsPort=34580+i,
                     x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
-                    y=5,
+                    y=self.cfg.uav.initPosition.y,
                     z=0.5,
                     R=0.0,
                     P=0.0,
@@ -265,27 +290,24 @@ class StaticObstacleEnv(gym.Env):
         """
         """归位所有无人机"""
         stateMsgs = []
-        uav_target_positions = []  # 记录每个无人机的目标位置
+        uavTargetPositions = []  # 记录每个无人机的目标位置
         rate = rospy.Rate(50)  # 50Hz
-        
         for uav in self.uavs:
             stateMsg = ModelState()
             stateMsg.model_name = "iris_" + str(uav.uavID)
             # 计算初始位置
-            initial_x = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums)
-            initial_y = 5
-            initial_z = 0.5
-            
-            stateMsg.pose.position.x = initial_x
-            stateMsg.pose.position.y = initial_y
-            stateMsg.pose.position.z = initial_z
-            
+            initialX = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums)
+            initialY = self.cfg.uav.initPosition.y
+            initialZ = self.cfg.uav.initPosition.z
+            stateMsg.pose.position.x = initialX
+            stateMsg.pose.position.y = initialY
+            stateMsg.pose.position.z = initialZ
+            uav.initPosition = Position(initialX, initialY, initialZ-0.25)
             # 计算目标悬停位置（在初始位置上方5米）
-            target_x = 0
-            target_y = 0
-            target_z = 5.0
-            uav_target_positions.append((target_x, target_y, target_z))
-            
+            targetX = self.cfg.uav.hoverPosition.x
+            targetY = self.cfg.uav.hoverPosition.y
+            targetZ = self.cfg.uav.hoverPosition.z
+            uavTargetPositions.append((targetX, targetY, targetZ))
             angle = np.pi / 2  # 90度，面朝y轴正方向
             quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, angle)
             stateMsg.pose.orientation.x = quaternion[0]
@@ -295,16 +317,14 @@ class StaticObstacleEnv(gym.Env):
             stateMsgs.append(stateMsg)
             self.uavSetState.publish(stateMsg)
         rospy.loginfo("无人机归位完成，开始悬停...")
-        
         # 延长发布时间，确保PX4接收到足够的setpoint
         for i in range(50):  # 发布1秒
             for j, uav in enumerate(self.uavs):
                 pose = Pose()
                 # 使用计算好的绝对目标位置
-                pose.position.x = uav_target_positions[j][0]
-                pose.position.y = uav_target_positions[j][1] 
-                pose.position.z = uav_target_positions[j][2]
-                
+                pose.position.x = uavTargetPositions[j][0]
+                pose.position.y = uavTargetPositions[j][1] 
+                pose.position.z = uavTargetPositions[j][2]
                 angle = np.pi / 2
                 quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, angle)
                 pose.orientation.x = quaternion[0]
@@ -313,7 +333,6 @@ class StaticObstacleEnv(gym.Env):
                 pose.orientation.w = quaternion[3]
                 uav.shotTargetPub.publish(pose)
             rate.sleep()
-
         # 等待无人机位置更新
         rospy.sleep(2)
         # 确保所有无人机的通信都已建立
@@ -323,20 +342,16 @@ class StaticObstacleEnv(gym.Env):
                 rospy.logwarn(f"等待无人机 {i} 位置信息...")
                 rospy.sleep(0.5)
             rospy.loginfo(f"无人机 {i} 通信正常")
-        
-        """启动并悬停无人机 - 使用绝对目标位置"""
+        """启动并悬停无人机，使用绝对目标位置"""
         rospy.loginfo("开始发布目标位置...")
-        
-        
         # 延长发布时间，确保PX4接收到足够的setpoint
         for i in range(500):  # 发布10秒
             for j, uav in enumerate(self.uavs):
                 pose = Pose()
                 # 使用计算好的绝对目标位置
-                pose.position.x = uav_target_positions[j][0]
-                pose.position.y = uav_target_positions[j][1] 
-                pose.position.z = uav_target_positions[j][2]
-                
+                pose.position.x = uavTargetPositions[j][0]
+                pose.position.y = uavTargetPositions[j][1] 
+                pose.position.z = uavTargetPositions[j][2]
                 angle = np.pi / 2
                 quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, angle)
                 pose.orientation.x = quaternion[0]
@@ -345,7 +360,6 @@ class StaticObstacleEnv(gym.Env):
                 pose.orientation.w = quaternion[3]
                 uav.shotTargetPub.publish(pose)
             rate.sleep()
-        
         # 检查所有无人机EKF状态（可选，至少要有current_position）
         for i, uav in enumerate(self.uavs):
             retry = 0
@@ -356,7 +370,6 @@ class StaticObstacleEnv(gym.Env):
                 retry += 1
                 if retry > 20:
                     break
-
         rospy.loginfo("切换到OFFBOARD模式...")
         # 逐个切换无人机模式，增加延时
         for i, uav in enumerate(self.uavs):
@@ -365,22 +378,19 @@ class StaticObstacleEnv(gym.Env):
             cmdMsg.data = "OFFBOARD"
             uav.communication.cmd_callback(cmdMsg)
             rospy.sleep(3.0)  # 增加等待时间到3秒
-            
             cmdMsg.data = "ARM"
             uav.communication.cmd_callback(cmdMsg)
             rospy.loginfo(f"解锁无人机 {i}")
             rospy.sleep(2.0)  # 增加等待时间到2秒
-        
         # 继续发布setpoint，确保无人机起飞
         rospy.loginfo("持续发布setpoint，等待起飞...")
         for i in range(300):  # 继续发布15秒
             for j, uav in enumerate(self.uavs):
                 pose = Pose()
                 # 继续使用绝对目标位置
-                pose.position.x = uav_target_positions[j][0]
-                pose.position.y = uav_target_positions[j][1]
-                pose.position.z = uav_target_positions[j][2]
-                
+                pose.position.x = uavTargetPositions[j][0]
+                pose.position.y = uavTargetPositions[j][1]
+                pose.position.z = uavTargetPositions[j][2]
                 angle = np.pi / 2
                 quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, angle)
                 pose.orientation.x = quaternion[0]
@@ -389,31 +399,25 @@ class StaticObstacleEnv(gym.Env):
                 pose.orientation.w = quaternion[3]
                 uav.shotTargetPub.publish(pose)
             rate.sleep()
-        
         # 检查无人机是否到达指定高度，增加超时机制
         rospy.loginfo("检查无人机起飞状态...")
         timeout_count = 0
         max_timeout = 600  # 30秒超时
-        
         while timeout_count < max_timeout:
             readyNum = 0
             for uav in self.uavs:
                 if uav.communication.current_position and uav.communication.current_position.z > 4.5:
                     readyNum += 1
-            
             # rospy.loginfo(f"已起飞无人机数量: {readyNum}/{self.uavNums}")
-            
             if readyNum == self.uavNums:
                 rospy.loginfo("所有无人机已到达目标高度")
                 break
-                
             # 继续发布setpoint
             for j, uav in enumerate(self.uavs):
                 pose = Pose()
-                pose.position.x = uav_target_positions[j][0]
-                pose.position.y = uav_target_positions[j][1]
-                pose.position.z = uav_target_positions[j][2]
-                
+                pose.position.x = uavTargetPositions[j][0]
+                pose.position.y = uavTargetPositions[j][1]
+                pose.position.z = uavTargetPositions[j][2]
                 angle = np.pi / 2
                 quaternion = tf.transformations.quaternion_from_euler(0.0, 0.0, angle)
                 pose.orientation.x = quaternion[0]
@@ -421,20 +425,17 @@ class StaticObstacleEnv(gym.Env):
                 pose.orientation.z = quaternion[2]
                 pose.orientation.w = quaternion[3]
                 uav.shotTargetPub.publish(pose)
-            
             rate.sleep()
             timeout_count += 1
-        
+        rospy.loginfo(f"共{self.uavNums}个无人机，已达到目标高度有{readyNum}个")
         if timeout_count >= max_timeout:
             rospy.logwarn("部分无人机未能到达目标高度，继续执行...")
-        
         # 切换到悬停状态
         rospy.loginfo("切换到悬停状态...")
         for uav in self.uavs:
             cmdMsg = String()
             cmdMsg.data = "HOVER"
             uav.communication.cmd_callback(cmdMsg)
-        
         # 等待无人机稳定
         rospy.sleep(2)
 
@@ -457,8 +458,7 @@ class StaticObstacleEnv(gym.Env):
                         break
                 if flag:
                     break
-            self.targets.append(Target(i, x, y, z))
-
+            self.targets.append(Target(x, y, z))
 
     def _static_obstacles_generate(self) -> None:
         """
@@ -469,7 +469,7 @@ class StaticObstacleEnv(gym.Env):
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/cube_template.sdf"), 'r') as f:
             cubeTemplate = f.read()
         minDistBetweenObstacles = self.length * 0.04  # 障碍物之间最小距离
-        minDistBetweenObstaclesAndTargets = self.targetRadius * 4  # 障碍物与目标点之间最小距离
+        minDistBetweenObstaclesAndTargets = self.targetRadius * 2  # 障碍物与目标点之间最小距离
         for i in range(self.staticObstaclesNum):
             for _ in range(100):  # 最多尝试100次
                 flag = True
@@ -489,7 +489,7 @@ class StaticObstacleEnv(gym.Env):
                         break
                 # 检查与目标点的距离
                 for target in self.targets:
-                    if math.sqrt((x - target.x) ** 2 + (y - target.y) ** 2 + (z - target.z) ** 2) < minDistBetweenObstaclesAndTargets:
+                    if math.sqrt((x - target.x) ** 2 + (y - target.y) ** 2 + (z - target.z) ** 2) < (minDistBetweenObstaclesAndTargets + np.sqrt(halfLength ** 2 + halfWidth ** 2)):
                         flag = False
                         break
                 if flag:
@@ -509,6 +509,22 @@ class StaticObstacleEnv(gym.Env):
             except rospy.ServiceException as e:
                 rospy.logerr("生成障碍物失败: %s", e)
 
+    def _uav_information_collection(self) -> tuple[list[np.ndarray], list[list[float]]]:
+        """
+        无人机信息采集
+        """
+        # 深度信息，无人机状态
+        depthInformations, uavStates = [], []
+        # 更新无人机信息
+        for i, uav in enumerate(self.uavs):
+            uav.getInformation()
+            uavStates.append([self.targets[i].x - uav.currentPosition.x, 
+                              self.targets[i].y - uav.currentPosition.y, 
+                              self.targets[i].z - uav.currentPosition.z,
+                              uav.currentYaw])
+            depthInformations.append(uav.depthImage)
+        return depthInformations, uavStates
+        
     def _publish_maker(self):
         """
         消息发布
@@ -537,8 +553,6 @@ class StaticObstacleEnv(gym.Env):
             marker.pose.position.z = target.z
             markerArray.markers.append(marker)
         self.targetVisualization.publish(markerArray)
-
-
 
 
 if __name__ == "__main__":

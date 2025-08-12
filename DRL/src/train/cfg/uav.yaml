@@ -1,3 +1,13 @@
 uav:
   # uav相关设置
   uavNums: 2
+  # 无人机初始化位置，目前只有y有用
+  initPosition:
+    x: 0
+    y: 2
+    z: 0.5
+  # 无人机悬停位置
+  hoverPosition:
+    x: 0
+    y: 0
+    z: 5
