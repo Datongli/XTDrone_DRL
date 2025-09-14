@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'
 import hydra
 # import wandb
 import time
+import numpy as np
 from env.scripts.env import StaticObstacleEnv
 
 
@@ -15,9 +16,16 @@ def main(cfg):
     env = StaticObstacleEnv(cfg)
     time.sleep(2)
     state =  env.reset()  # 测试环境的reset功能
+    """测试环境的step功能"""
+    actions = np.array([[[-1, 0, 0, np.pi/2], [1, 0, 0, np.pi/2]]])
     while True:
-        time.sleep(10)
-        state = env.reset()
+        while True:
+            for action in actions:
+                nextState, reward = env.step(action)
+            # 先用两个做测试
+            if env.uavs[0].done and env.uavs[1].done:
+                break
+        env.reset()
 
 
 if __name__ == "__main__":
