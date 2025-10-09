@@ -26,11 +26,25 @@ class UAVResetState(Enum):
     RESET_COMPLETE = 2  # 重置完成
 
 
+class UAVInfo(Enum):
+    """无人机状态枚举"""
+    SUCCESS = 0  # 成功到达目标点
+    COLLISION = 1  # 发生碰撞
+    STEP_OVER = 2  # 超出最大步长
+    NORMAL = 3  # 正常状态
+
+
 class UAV:
     def __init__(self, uavID: int| float) -> None:
+        """
+        构造函数
+        :param uavID: 无人机ID
+        :return: None
+        """
         """无人机信息"""
         self.uavID: int = uavID  # 无人机ID
         self.done: bool = False  # 终止状态
+        self.info: UAVInfo = UAVInfo.NORMAL  # 无人机信息
         self.firstDone: bool = False  # 无人机是否第一次终止
         self.hoverFlage: bool = False # 无人机是否悬停好，悬停好后才可以开始飞行
         self.communication = Communication("iris", str(self.uavID))  # 无人机通信模块
@@ -41,6 +55,7 @@ class UAV:
         self.currentPosition: Position = None  # 无人机当前位置（东北天坐标系下）
         self.currentYaw: float = None  # 无人机当前偏航角
         self.depthImage: np.ndarray = None  # 无人机当前深度图像
+        self.depthImage8u: np.ndarray = None  # 可视化用的8位灰度图
         """相关话题、服务"""
         # 短期目标发布
         self.shotTargetPub = rospy.Publisher("/xtdrone/"+"iris"+'_'+str(self.uavID)+"/cmd_pose_enu", Pose, queue_size=3)
@@ -48,7 +63,10 @@ class UAV:
         self.depthCameraSub = rospy.Subscriber("/iris_" + str(self.uavID) + "/realsense/depth_camera/depth/image_raw", Image, self._depthImageCallback ,queue_size=1)
     
     def getInformation(self) -> None:
-        """获取无人机信息"""
+        """
+        获取无人机信息
+        :return: None
+        """
         self.currentPosition = (self.communication.current_position if self.initPosition is None 
                                 else Position(self.communication.current_position.x + self.initPosition.x, 
                                               self.communication.current_position.y + self.initPosition.y, 
@@ -56,7 +74,10 @@ class UAV:
         self.currentYaw = self.communication.current_yaw
 
     def changeDone(self) -> None:
-        """改变无人机终止状态"""
+        """
+        改变无人机终止状态
+        :return: None
+        """
         if self.hoverFlage:
             # 已经悬停好
             if self.done == False:
@@ -68,14 +89,80 @@ class UAV:
             pass
 
     def _depthImageCallback(self, depthImage: Image) -> None:
-        """深度相机数据回调函数"""
-        data = bytes(depthImage.data)  # 转换为字节数组
-        self.depthImage = np.frombuffer(data, dtype=np.float32).reshape((depthImage.height, depthImage.width))
-        # 归一化到0-255
-        minValue, maxValue = np.nanmin(self.depthImage), np.nanmax(self.depthImage)
-        self.depthImage = ((self.depthImage - minValue) / (maxValue - minValue) * 255).astype(np.uint8)
-
-
+        """
+        深度相机数据回调：
+        - 按 encoding 正确解析（32FC1: float32 米；16UC1: uint16 毫米）
+        - 处理大小端与逐行对齐（step），裁剪到有效宽度
+        - 将无效值（NaN/Inf 或 16UC1 的 0）统一为 NaN，再用“最远可见深度”填充，避免 NaN 传播
+        - 生成两份数据：
+            self.depthImage  -> float32（米），无 NaN，用于状态/奖励计算
+            self.depthImage8u -> uint8（0-255），仅用于可视化
+        """
+        try:
+            # 读取图像基础元数据
+            imageHeight, imageWidth = int(depthImage.height), int(depthImage.width)
+            encoding = depthImage.encoding                 # 常见: '32FC1' 或 '16UC1'
+            isBigEndian = bool(depthImage.is_bigendian)    # 数据是否为大端序
+            stepBytes = int(depthImage.step)               # 每行占用的总字节数（可能大于 width*bpp，含对齐填充）
+            # 根据编码与大小端选择 numpy dtype 和每像素字节数
+            if encoding.upper() == '32FC1':
+                dataType = np.dtype('>f4' if isBigEndian else '<f4')  # 32 位浮点
+                bytesPerPixel = 4
+            elif encoding.upper() == '16UC1':
+                dataType = np.dtype('>u2' if isBigEndian else '<u2')  # 16 位无符号整型
+                bytesPerPixel = 2
+            else:
+                rospy.logwarn_throttle(5.0, f"Unsupported depth encoding: {encoding}")
+                return
+            # 使用 step 做逐行对齐读取，再裁剪到真实宽度（去掉行尾对齐填充）
+            dataBuffer = memoryview(depthImage.data)               # 零拷贝视图
+            flatArray = np.frombuffer(dataBuffer, dtype=dataType)  # 一维数组视图
+            expectedElementsPerRow = stepBytes // bytesPerPixel    # 每行按 step 可容纳的元素数
+            totalExpectedElements = expectedElementsPerRow * imageHeight
+            if flatArray.size < totalExpectedElements:
+                rospy.logwarn_throttle(5.0, f"Depth buffer too small: got {flatArray.size}, expected >= {totalExpectedElements}")
+                return
+            # 先按带对齐的行宽 reshape，再裁剪到 imageWidth，最后 copy 以脱离原始缓冲区
+            depthArray = flatArray[:totalExpectedElements] \
+                .reshape(imageHeight, expectedElementsPerRow)[:, :imageWidth] \
+                .copy()
+            # 将不同编码统一到 float32（米），并显式标注无效像素为 NaN
+            if encoding.upper() == '16UC1':
+                # RealSense 通常 16UC1 为毫米，且 0 表示无效
+                invalidMask = (depthArray == 0)
+                depthArray = depthArray.astype(np.float32)
+                depthArray[invalidMask] = np.nan
+                depthArray /= 1000.0  # mm -> m
+            else:
+                # 32FC1 通常已是米，但可能自带 NaN/Inf
+                depthArray = depthArray.astype(np.float32, copy=False)
+            # 将 Inf 也视为无效
+            depthArray[~np.isfinite(depthArray)] = np.nan
+            # 如果整帧都无效：保留上一帧，避免把全 NaN/全 0 注入状态与奖励
+            finiteMask = np.isfinite(depthArray)
+            if not np.any(finiteMask):
+                if self.depthImage is not None:
+                    rospy.logwarn_throttle(5.0, "Depth frame has no valid pixels; keeping previous depthImage")
+                    return
+                # 没有上一帧则安全回退为全 0（可按需求替换为相机最大量程）
+                depthArray = np.zeros((imageHeight, imageWidth), dtype=np.float32)
+            # 用当前帧的“有限像素最大值”填充 NaN（把无回波视为“最远”）
+            if np.any(~finiteMask):
+                finiteMax = np.nanmax(depthArray)
+                depthArray = np.where(finiteMask, depthArray, finiteMax)
+            # 保存用于训练/奖励的无 NaN 深度（米）
+            self.depthImage = depthArray
+            # 生成可视化 8-bit 灰度图：线性归一化到 [0,255]，并避免除零
+            depthMin = float(np.min(depthArray))
+            depthMax = float(np.max(depthArray))
+            if depthMax > depthMin:
+                normalized = (depthArray - depthMin) / (depthMax - depthMin)
+            else:
+                normalized = np.zeros_like(depthArray, dtype=np.float32)
+            self.depthImage8u = (normalized * 255.0 + 0.5).astype(np.uint8)
+        except Exception as error:
+            # 节流打印避免刷屏
+            rospy.logwarn_throttle(5.0, f"Depth callback error: {error}")
 
 
 if __name__ == "__main__":
