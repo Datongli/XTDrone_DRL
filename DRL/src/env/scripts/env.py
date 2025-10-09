@@ -18,7 +18,7 @@ from env.scripts.target import Target
 from env.scripts.obstacle import Obstacle
 from visualization_msgs.msg import MarkerArray, Marker
 from gazebo_msgs.msg import ModelState, ContactsState
-from uav.scripts.uav import UAV, Position, UAVResetState
+from uav.scripts.uav import UAV, Position, UAVResetState, UAVInfo
 from mavros_msgs.srv import ParamSet, CommandLong, ParamGet
 from mavros_msgs.msg import ParamValue
 import threading
@@ -30,6 +30,11 @@ class StaticObstacleEnv(gym.Env):
     静态障碍物环境
     """
     def __init__(self, cfg) -> None:
+        """
+        构造函数
+        :param cfg: 配置
+        :return: None
+        """
         self.cfg = cfg
         """初始化环境中参数"""
         # 长宽高
@@ -43,6 +48,7 @@ class StaticObstacleEnv(gym.Env):
         self.uavNums: int = cfg.uav.uavNums  # 无人机数量
         self.targets: list[Target] = []  # 不同无人机的目标点集合
         self.targetRadius: int| float = cfg.env.targetRadius  # 目标点半径
+        self.stepCount: int = 0  # 步数
         port = "11311"  # ROS端口号
         """使用给定的启动文件名来启动模拟"""
         # 调整gazebo世界world文件的参数
@@ -87,6 +93,7 @@ class StaticObstacleEnv(gym.Env):
         重置环境
         重新随机生成障碍物，将无人机重置到初始位置并悬停，规划无人机目标点
         发布目标点和无人机状态，传感器数据
+        :return: 无人机信息
         """
         super().reset()
         """gazebo物理仿真继续运行"""
@@ -132,7 +139,7 @@ class StaticObstacleEnv(gym.Env):
         uavInformations = []
         for uav in self.uavs:
             depthInformation, uavState = self._uav_information_collection(uav)  # 深度相机信息和相对距离偏航角等
-            uavInformations.append((depthInformation, uavState))
+            uavInformations.append({"depthInformation": depthInformation, "uavState": uavState})
             uav.getInformation()  # 调试用
         rospy.loginfo("无人机信息采集完成")
         # 暂停gazebo物理仿真
@@ -152,6 +159,7 @@ class StaticObstacleEnv(gym.Env):
         """欲返回信息"""
         nextStates = [None for _ in range(self.uavNums)]  # 无人机的状态
         rewards = [0 for _ in range(self.uavNums)]  # 奖励
+        dones = [False for _ in range(self.uavNums)]  # 每个无人机是否结束
         """gazebo物理仿真继续运行"""
         rospy.wait_for_service("/gazebo/unpause_physics")
         try:
@@ -160,19 +168,22 @@ class StaticObstacleEnv(gym.Env):
             rospy.logerr("取消暂停gazebo物理仿真失败: %s", e)
         """执行无人机动作"""
         rate = rospy.Rate(50)  # 50Hz
-        for _ in range(100):  # 计时一段时间
+        for _ in range(100):
+            i = 0  # 计时一段时间
             for uav in self.uavs:
                 # 跳过已完成或正在重置的无人机
                 if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
                     continue
                 pose = self.make_pose(
-                    uav.currentPosition.x - uav.initPosition.x + actions[uav.uavID][0],
-                    uav.currentPosition.y - uav.initPosition.y + actions[uav.uavID][1],
-                    uav.currentPosition.z - uav.initPosition.z + actions[uav.uavID][2],
-                    actions[uav.uavID][3])
+                    uav.currentPosition.x - uav.initPosition.x + actions[i][0],
+                    uav.currentPosition.y - uav.initPosition.y + actions[i][1],
+                    uav.currentPosition.z - uav.initPosition.z + actions[i][2],
+                    actions[i][3])
                 uav.shotTargetPub.publish(pose)
+                i += 1  # 无人机索引增加
             rate.sleep()
         """判断无人机状态与计算奖励"""
+        self.stepCount += 1  # 步数增加
         for i, uav in enumerate(self.uavs):
             # 跳过正在重置的无人机
             if self.uavResetStates[i] == UAVResetState.RESETTING:
@@ -190,10 +201,16 @@ class StaticObstacleEnv(gym.Env):
             if depthInformation is not None:
                 rewards[i] += - np.min(depthInformation) * 0.1
             # 碰撞惩罚
-            if uav.currentPosition.z >= self.height:
+            if uav.currentPosition.z >= self.height: 
                 uav.changeDone()
-            if uav.firstDone:  # 此时firstDone为True的都是发生了碰撞的
+            # 超过最大步长
+            if self.stepCount == self.cfg.env.maxStep:
+                uav.changeDone()
+                uav.info = UAVInfo.STEP_OVER  # 将无人机信息设置为超出最大步长
+            if uav.firstDone:  # 此时firstDone为True的是发生了碰撞或者超出最大步长的
                 rewards[i] -= 100
+                if uav.info == UAVInfo.NORMAL:
+                    uav.info = UAVInfo.COLLISION  # 将无人机信息设置为碰撞
             # 靠近目标奖励
             rewards[i] += - np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                                     (self.targets[i].y - uav.currentPosition.y) ** 2 + 
@@ -203,8 +220,10 @@ class StaticObstacleEnv(gym.Env):
                        (self.targets[i].y - uav.currentPosition.y) ** 2 + 
                        (self.targets[i].z - uav.currentPosition.z) ** 2) <= self.targetRadius:
                 rewards[i] += 100
+                uav.info = UAVInfo.SUCCESS  # 将无人机信息设置为成功
                 uav.changeDone()
-            nextStates[i] = (depthInformation, uavState)
+            nextStates[i] = {"depthInformation": depthInformation, "uavState": uavState}
+            dones[i] = uav.done
             # 将第一次done的无人机，归位，锁定，本轮不再起飞
             if uav.firstDone:
                 # 启动异步重置
@@ -215,17 +234,20 @@ class StaticObstacleEnv(gym.Env):
             self.pause()
         except rospy.ServiceException as e:
             rospy.logerr("暂停gazebo物理仿真失败: %s", e)
-        return nextStates, rewards
+        return nextStates, rewards, dones
 
     def render(self) -> None:
         """
         gymnasium规定的渲染函数，在当前环境中并不使用，但是需要重写
+        :return: None
         """
         pass
 
     def _collisionDetectionCallback(self, collisionData: ContactsState) -> None:
         """
         碰撞检测回调函数
+        :param collisionData: 碰撞数据
+        :return: None
         """
         uavID = ["iris_" + str(i) for i in range(self.uavNums)]
         for contact in collisionData.states:
@@ -238,6 +260,7 @@ class StaticObstacleEnv(gym.Env):
         """
         根据cfg中的参数，调整gazebo世界world文件的参数
         主要作用是根据cfg中的参数，调整gazebo世界中四个围墙的位置
+        :return: None
         """
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "launch/XTDrone_DRL.world"), 'w') as f:
             with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "launch/XTDrone_DRL.world.template"), 'r') as template:
@@ -263,6 +286,8 @@ class StaticObstacleEnv(gym.Env):
     def _generate_multi_uav_launch(self, launchFile: str) -> None:
         """
         生成多无人机launch文件
+        :param launchFile: launch文件路径
+        :return: None
         """
         """构造多无人机launch文件"""
         # launch文件头
@@ -326,6 +351,7 @@ class StaticObstacleEnv(gym.Env):
     def _wait_for_gazebo_services(self) -> None:
         """
         等待 Gazebo 服务启动
+        :return: None
         """
         servicesToWait = [
             "/gazebo/unpause_physics",
@@ -349,6 +375,7 @@ class StaticObstacleEnv(gym.Env):
     def _wait_for_mavros_nodes(self) -> None:
         """
         等待所有 MAVROS 节点启动
+        :return: None
         """
         rospy.loginfo("等待 MAVROS 节点启动...")
         for i in range(self.uavNums):
@@ -380,6 +407,7 @@ class StaticObstacleEnv(gym.Env):
     def _wait_for_all_uavs_reset_complete(self) -> None:
         """
         等待所有无人机完成异步重置
+        :return: None
         """
         rospy.loginfo("等待所有无人机完成异步重置...")
         maxWaitTime = 60  # 最大等待时间（秒）
@@ -407,6 +435,7 @@ class StaticObstacleEnv(gym.Env):
     def _uav_reset(self) -> None:
         """
         所有无人机归位并悬停（并行批量处理）
+        :return: None
         """
         """归位所有无人机"""
         for uav in self.uavs:
@@ -567,6 +596,7 @@ class StaticObstacleEnv(gym.Env):
     def _target_generate(self) -> None:
         """
         生成目标点
+        :return: None
         """
         # 先清空目标点
         self.targets.clear()
@@ -590,6 +620,7 @@ class StaticObstacleEnv(gym.Env):
     def _static_obstacles_generate(self) -> None:
         """
         生成静态障碍物
+        :return: None
         """
         rospy.wait_for_service("/gazebo/spawn_sdf_model")
         # 读取sdf模板文件
@@ -656,6 +687,9 @@ class StaticObstacleEnv(gym.Env):
         """
         发送 flight termination 命令:
         enable=True 立即终止；enable=False 解除终止
+        :param uav: 无人机对象
+        :param enable: 是否启用飞行终止
+        :return: None
         """
         try:
             cmdService = rospy.ServiceProxy(f"/iris_{uav.uavID}/mavros/cmd/command", CommandLong)
@@ -673,6 +707,8 @@ class StaticObstacleEnv(gym.Env):
     def _start_async_uav_reset(self, uav: UAV) -> None:
         """
         启动无人机异步重置
+        :param uav: 无人机对象
+        :return: None
         """
         with self.resetLock:
             if self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
@@ -691,6 +727,8 @@ class StaticObstacleEnv(gym.Env):
     def _async_uav_reset_worker(self, uav: UAV) -> None:
         """
         异步无人机重置工作线程
+        :param uav: 无人机对象
+        :return: None
         """
         try:
             rospy.loginfo(f"异步重置无人机 iris_{uav.uavID} 开始")
@@ -739,6 +777,8 @@ class StaticObstacleEnv(gym.Env):
     def _emergency_motor_kill(self, uav: UAV) -> None:
         """
         立即终止无人机电机：螺旋桨停止
+        :param uav: 无人机对象
+        :return: None
         """
         try:
             cmdService = rospy.ServiceProxy("/iris_" + str(uav.uavID) + "/mavros/cmd/command", CommandLong)
@@ -755,6 +795,8 @@ class StaticObstacleEnv(gym.Env):
     def _force_disarm(self, uav: UAV) -> None:
         """
         显式DISARM保证控制器复位
+        :param uav: 无人机对象
+        :return: None
         """
         try:
             cmdService = rospy.ServiceProxy(f"/iris_{uav.uavID}/mavros/cmd/command", CommandLong)
@@ -774,6 +816,8 @@ class StaticObstacleEnv(gym.Env):
     def _comprehensive_px4_reset(self, uav: UAV) -> None:
         """
         重置PX4关键参数，避免状态混乱
+        :param uav: 无人机对象
+        :return: None
         """
         rospy.loginfo(f"开始综合重置PX4状态：iris_{uav.uavID}")
         try:
@@ -824,6 +868,8 @@ class StaticObstacleEnv(gym.Env):
     def _get_valid_px4_params(self, uav: UAV) -> set:
         """
         获取当前PX4版本支持的参数列表
+        :param uav: 无人机对象
+        :return: 支持的参数名集合
         """
         try:
             paramGetService = rospy.ServiceProxy(f'/iris_{uav.uavID}/mavros/param/get', ParamGet)
@@ -847,9 +893,12 @@ class StaticObstacleEnv(gym.Env):
             rospy.logwarn(f"无法获取参数列表: {e}")
             return None
         
-    def _send_recalibration_commands(self, uav: UAV, cmdService) -> None:
+    def _send_recalibration_commands(self, uav: UAV, cmdService: rospy.ServiceProxy) -> None:
         """
         发送重新校准命令
+        :param uav: 无人机对象
+        :param cmdService: 命令服务代理
+        :return: None
         """
         try:
             # 重置EKF
@@ -875,6 +924,8 @@ class StaticObstacleEnv(gym.Env):
     def _provide_initial_state(self, uav: UAV) -> None:
         """
         主动向EKF提供新的初始位姿，帮助收敛
+        :param uav: 无人机对象
+        :return: None
         """
         # 位姿发布
         visionPosePub = rospy.Publisher(f"/iris_{uav.uavID}/mavros/vision_pose/pose", PoseStamped, queue_size=10)
@@ -902,6 +953,7 @@ class StaticObstacleEnv(gym.Env):
     def _publish_maker(self) -> None:
         """
         消息发布
+        :return: None
         """
         """发布目标点，用于rviz中可视化"""
         markerArray = MarkerArray()
