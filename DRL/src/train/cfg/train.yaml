@@ -20,10 +20,10 @@ alphaLearningRate: 3e-4  # alpha的学习率
 targetEntity: 0.01  # 目标熵
 gamma: 0.99  # 奖励折扣因子
 tau: 0.005  # soft update参数
-numEpisodes: 500  # 训练轮次
-bufferSize: 10000  # 经验回放池容量
-minimalSize: 100  # 最小容量
-batchSize: 64  # 批次大小
+numEpisodes: 5000  # 训练轮次
+bufferSize: 5000  # 经验回放池容量
+minimalSize: 16  # 最小容量
+batchSize: 16  # 批次大小
 actorLearningRateDecayStep: 500  # actor学习率衰减步长
 actorLearningRateDecayGamma: 0.1  # actor学习率衰减系数
 criticLearningRateDecayStep: 500  # critic学习率衰减步长
@@ -32,8 +32,14 @@ criticLearningRateDecayGamma: 0.1  # critic学习率衰减系数
 
 # wandb参数
 wandb:
-  project: XTDrone_DRL
-  name: navigation_training
-  entity: XTDrone-DRL-UAV-Navigation
-  mode: offline # online
-  run_id: kw9xf9k9
+  enabled: True  # 是否启用wandb
+  project: XTDrone-DRL  # wandb项目名
+  name: navigation-training  # wandb实验名
+  entity: ldt20020517-beihang-university  # wandb实体名
+  mode: online   # wandb模式
+  id: kw9xf9k9  # wandb实验ID
+  dir: ../wandb  # wandb保存目录
+  resumeFlag: True  # 是否恢复实验
+  checkPointDir: ../checkPoints  # 模型保存目录
+  checkPointPath: ../checkPoints/kw9xf9k9.pt  # 模型保存路径
+  saveEvery: 1  # 每训练n轮保存一次模型

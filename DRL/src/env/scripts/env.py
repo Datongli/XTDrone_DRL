@@ -77,6 +77,7 @@ class StaticObstacleEnv(gym.Env):
         self.uavResetStates = [UAVResetState.NORMAL for _ in range(self.uavNums)]  # 无人机重置状态
         self.resetThreads = [None for _ in range(self.uavNums)]  # 重置线程
         self.resetLock = threading.Lock()  # 重置操作锁
+        self.activeResetCount: int =0  # 进行中的重置计数
         """设置topic发布者、订阅者、服务"""
         self.unpause = rospy.ServiceProxy("/gazebo/unpause_physics", Empty)          # 恢复物理模拟
         self.pause = rospy.ServiceProxy("/gazebo/pause_physics", Empty)              # 暂停物理模拟
@@ -231,7 +232,11 @@ class StaticObstacleEnv(gym.Env):
         """暂停gazebo物理仿真"""
         rospy.wait_for_service("/gazebo/pause_physics")
         try:
-            self.pause()
+            # 若任有进行中的无人机异步重置，跳过暂停
+            if self.activeResetCount == 0:
+                self.unpause()
+            else:
+                rospy.loginfo("仍有 %d 个无人机正在重置，跳过暂停gazebo物理仿真", self.activeResetCount)
         except rospy.ServiceException as e:
             rospy.logerr("暂停gazebo物理仿真失败: %s", e)
         return nextStates, rewards, dones
@@ -714,6 +719,7 @@ class StaticObstacleEnv(gym.Env):
             if self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
                 return  # 已在重置中，避免重复启动
             self.uavResetStates[uav.uavID] = UAVResetState.RESETTING
+            self.activeResetCount += 1  # 增加进行中的重置计数
             # 启动重置线程
             resetThread = threading.Thread(
                 target = self._async_uav_reset_worker,
@@ -732,6 +738,11 @@ class StaticObstacleEnv(gym.Env):
         """
         try:
             rospy.loginfo(f"异步重置无人机 iris_{uav.uavID} 开始")
+            # 取消gazebo暂停
+            try:
+                self.unpause()
+            except rospy.ServiceException as e:
+                rospy.logerr("取消gazebo暂停失败: %s", e)
             # 重置firstDone标志
             uav.firstDone = False
             # 发送飞行终止命令
@@ -773,6 +784,9 @@ class StaticObstacleEnv(gym.Env):
             # 即使失败也标记为完成，避免死锁
             with self.resetLock:
                 self.uavResetStates[uav.uavID] = UAVResetState.RESET_COMPLETE
+        finally:
+            with self.resetLock:
+                self.activeResetCount = max(0, self.activeResetCount - 1)
 
     def _emergency_motor_kill(self, uav: UAV) -> None:
         """
