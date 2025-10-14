@@ -10,6 +10,9 @@ import os
 import pickle
 import time
 import pickle
+from gazebo_msgs.srv import GetPhysicsProperties, SetPhysicsProperties
+from gazebo_msgs.msg import ModelStates
+import rospy
 
 
 class ReplayBuffer:
@@ -253,3 +256,32 @@ def load_checkPoint(checkPointPath: str, navigationAlgorithm: any, replayBuffer:
         except Exception:
             pass
     return checkPointState.get("episode", 0), replayBuffer
+
+
+def set_gazebo_unlimit(maxWaitTime: int| float = 20, timeStep = None, targeModels = None):
+    """
+    将gazebo的max_uodate_rate设置为0（不限制），可选调整timeStep
+    :param maxWaitTime: 最大等待时间
+    :param timeStep: 传入覆盖仿真的time_step，为None则保持原状
+    :param targeModels: 可选列表，要求这些模型名都出现在 /gazebo/model_states 后再解限
+    """
+    try:
+        if not rospy.core.is_initialized():
+            rospy.init_node("gazebo_turbo_helper", anonymous=True, disable_signals=True)
+        """等待物理服务可用"""
+        rospy.wait_for_service("/gazebo/get_physics_properties", timeout=maxWaitTime)
+        rospy.wait_for_service("/gazebo/set_physics_properties", timeout=maxWaitTime)
+        """获取当前物理属性"""
+        get_prop = rospy.ServiceProxy("/gazebo/get_physics_properties", GetPhysicsProperties)
+        set_prop = rospy.ServiceProxy("/gazebo/set_physics_properties", SetPhysicsProperties)
+        cur = get_prop()
+        new_time_step = float(timeStep) if (timeStep is not None) else cur.time_step
+        resp = set_prop(time_step=new_time_step,
+                        max_update_rate=0.0,  # 0 = 不限制
+                        gravity=cur.gravity,
+                        ode_config=cur.ode_config)
+        print(f"[gazebo] 已设置：time_step={new_time_step}, max_update_rate=0.0（无限制）")
+        return True
+    except Exception as e:
+        print(f"[gazebo] 设置失败：{e}")
+        return False

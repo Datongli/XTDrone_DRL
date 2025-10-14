@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+# 关键：若不是指定的 conda 解释器，则用它重新 exec 当前脚本
+CONDA_PY = "/home/ldt/anaconda3/envs/deeplearning/bin/python"
+if os.path.exists(CONDA_PY) and os.path.realpath(sys.executable) != os.path.realpath(CONDA_PY):
+    os.execv(CONDA_PY, [CONDA_PY, os.path.abspath(__file__), *sys.argv[1:]])
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 import hydra
 import wandb
@@ -14,6 +18,7 @@ from navigation.scripts.SAC import SAC
 from uav.scripts.uav import UAVInfo
 from tools import ReplayBuffer, moving_average, epsilon_annealing
 from tools import save_checkPoint, load_checkPoint, cfg_get, to_plain_cfg, get_lr_safe
+from tools import set_gazebo_unlimit
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
@@ -53,6 +58,10 @@ def main(cfg) -> None:
     replayBuffer = ReplayBuffer(cfg.bufferSize)  # 实例化经验回放缓冲区
     env = StaticObstacleEnv(cfg)  # 实例化环境
     time.sleep(2)  # 必要，等待环境内部资源初始化缓冲完成
+    # gazebo加速相关
+    turboEnabled = bool(cfg_get(cfg, "gazebo.turbo.enabled", True))
+    turboTimeStep = cfg_get(cfg, "gazebo.turbo.timeStep", None)
+    gazeboTurboApplied = False
     """wandb与checkPoint的整合"""
     # 准备checkPoint的存储目录
     checkPointDir = os.path.abspath(os.path.join(os.getcwd(), checkPointDir))
@@ -88,6 +97,14 @@ def main(cfg) -> None:
             episodeIndex = startEpisodeIndex  # 迭代轮数
             while episodeIndex < totalEpisodes:
                 """环境重置"""
+                # 应用gazebo加速
+                if turboEnabled and not gazeboTurboApplied:
+                    set_gazebo_unlimit(
+                        maxWaitTime=20,
+                        timeStep=None,
+                        targeModels=None
+                    )
+                    gazeboTurboApplied = True  # 标记已应用
                 states =  env.reset()  # 获取状态信息（字典）
                 time.sleep(2)  # 必要，等待环境内部资源初始化缓冲完成
                 """初始化一些记录变量"""
