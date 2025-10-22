@@ -209,18 +209,18 @@ class StaticObstacleEnv(gym.Env):
                 uav.changeDone()
                 uav.info = UAVInfo.STEP_OVER  # 将无人机信息设置为超出最大步长
             if uav.firstDone:  # 此时firstDone为True的是发生了碰撞或者超出最大步长的
-                rewards[i] -= 100
+                rewards[i] -= 1000
                 if uav.info == UAVInfo.NORMAL:
                     uav.info = UAVInfo.COLLISION  # 将无人机信息设置为碰撞
             # 靠近目标奖励
             rewards[i] += - np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                                     (self.targets[i].y - uav.currentPosition.y) ** 2 + 
-                                    (self.targets[i].z - uav.currentPosition.z) ** 2) * 0.1
+                                    (self.targets[i].z - uav.currentPosition.z) ** 2) * 5
             # 到达目标奖励
             if np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                        (self.targets[i].y - uav.currentPosition.y) ** 2 + 
                        (self.targets[i].z - uav.currentPosition.z) ** 2) <= self.targetRadius:
-                rewards[i] += 100
+                rewards[i] += 1000
                 uav.info = UAVInfo.SUCCESS  # 将无人机信息设置为成功
                 uav.changeDone()
             nextStates[i] = {"depthInformation": depthInformation, "uavState": uavState}
@@ -528,11 +528,6 @@ class StaticObstacleEnv(gym.Env):
             rospy.sleep(2.0)  # 增加等待时间到2秒
         # 继续发布setpoint，确保无人机起飞
         rospy.loginfo("持续发布setpoint，等待起飞...")
-        """测试用，观测无人机的位置"""
-        for uav in self.uavs:
-            uav.getInformation()
-            rospy.loginfo(f"无人机{uav.uavID}位置：x={uav.currentPosition.x}, y={uav.currentPosition.y}, z={uav.currentPosition.z}")
-            rospy.loginfo(f"无人机{uav.uavID}com中记录：x={uav.communication.current_position.x}, y={uav.communication.current_position.y}, z={uav.communication.current_position.z}")
         for i in range(300):  # 继续发布
             for j, uav in enumerate(self.uavs):
                 pose = self.make_pose(uavTargetPositions[j][0],
@@ -768,13 +763,13 @@ class StaticObstacleEnv(gym.Env):
             # 设置无人机状态
             uav.done = True
             uav.getInformation()
-            rospy.loginfo(f"无人机 iris_{uav.uavID} 的记录坐标为x={uav.currentPosition.x}, y={uav.currentPosition.y}, z={uav.currentPosition.z}")
+            # rospy.loginfo(f"无人机 iris_{uav.uavID} 的记录坐标为x={uav.currentPosition.x}, y={uav.currentPosition.y}, z={uav.currentPosition.z}")
             rospy.loginfo(f"无人机 iris_{uav.uavID} 已锁定在地面上")
             # 让无人机降落
             cmdMsg = String()
             cmdMsg.data = "AUTO.LAND"
             uav.communication.cmd_callback(cmdMsg)
-            rospy.sleep(20)  # 等待降落完成
+            rospy.sleep(5)  # 等待降落完成
             # 标记重置完成
             with self.resetLock:
                 self.uavResetStates[uav.uavID] = UAVResetState.RESET_COMPLETE
