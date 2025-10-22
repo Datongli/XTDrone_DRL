@@ -13,22 +13,35 @@ launchFile: multi_uav_static_env.launch
 retrain: True  # 是否重新训练
 epochs: 1e5  # 训练轮数
 seed: 0  # 随机种子
-actorLearningRate: 3e-4  # 策略网络学习率
-criticLearningRate: 3e-3  # 动作价值网络学习率
+actorLearningRate: 1e-4  # 策略网络学习率
+criticLearningRate: 1e-4  # 动作价值网络学习率
 alpha: 0.01  # alpha值
-alphaLearningRate: 3e-4  # alpha的学习率
+alphaLearningRate: 1e-4  # alpha的学习率
 targetEntity: 0.01  # 目标熵
 gamma: 0.99  # 奖励折扣因子
 tau: 0.005  # soft update参数
 numEpisodes: 5000  # 训练轮次
 bufferSize: 5000  # 经验回放池容量
-minimalSize: 16  # 最小容量
-batchSize: 16  # 批次大小
+minimalSize: 128  # 最小容量
+batchSize: 128  # 批次大小
 actorLearningRateDecayStep: 500  # actor学习率衰减步长
 actorLearningRateDecayGamma: 0.1  # actor学习率衰减系数
 criticLearningRateDecayStep: 500  # critic学习率衰减步长
 criticLearningRateDecayGamma: 0.1  # critic学习率衰减系数
+normalizeDepth: True  # 是否归一化深度信息
 
+# 探索参数
+explore:
+  warmupEpisodes: 10 # 预热轮次
+  sigma0: 0.2  # 初始探索噪声标准差
+  sigmaT: 0.05  # 最终探索噪声标准差
+
+# gazebo参数
+gazebo:
+  gui: True  # 是否启用gui
+  turbo:
+    enabled: True  # 加速开关
+    timeStep: None  # 时间步长，None则保持原状
 
 # wandb参数
 wandb:
@@ -37,9 +50,9 @@ wandb:
   name: navigation-training  # wandb实验名
   entity: ldt20020517-beihang-university  # wandb实体名
   mode: online   # wandb模式
-  id: kw9xf9k9  # wandb实验ID
+  id: kw9xf9k8  # wandb实验ID
   dir: ../wandb  # wandb保存目录
   resumeFlag: True  # 是否恢复实验
   checkPointDir: ../checkPoints  # 模型保存目录
-  checkPointPath: ../checkPoints/kw9xf9k9.pt  # 模型保存路径
+  checkPointPath: ../checkPoints/kw9xf9k8.pt  # 模型保存路径
   saveEvery: 1  # 每训练n轮保存一次模型
