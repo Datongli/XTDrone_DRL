@@ -32,9 +32,12 @@ class DepthCameraFeatureExtractor(nn.Module):
         # 展平
         self.flatten = nn.Flatten()
         # 归一化层
-        self.bn1 = nn.LazyBatchNorm2d()
-        self.bn2 = nn.LazyBatchNorm2d()
-        self.bn3 = nn.LazyBatchNorm2d()
+        # self.bn1 = nn.LazyBatchNorm2d()
+        # self.bn2 = nn.LazyBatchNorm2d()
+        # self.bn3 = nn.LazyBatchNorm2d()
+        self.bn1 = nn.Identity()  # 有说法是BN会在RL中引入不稳定噪声，因此暂时取消
+        self.bn2 = nn.Identity()
+        self.bn3 = nn.Identity()
         # 池化
         self.pool = nn.MaxPool2d(kernel_size=[2, 2], stride=[2, 2])
         # 激活层
@@ -45,7 +48,8 @@ class DepthCameraFeatureExtractor(nn.Module):
         self.fc3 = nn.LazyLinear(out_features=64)
         self.fc4 = nn.LazyLinear(out_features=4)
         # dropout层
-        self.dropout = nn.Dropout(p=0.1)
+        # self.dropout = nn.Dropout(p=0.1)
+        self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播
@@ -95,7 +99,8 @@ class TrackFeatureExtractor(nn.Module):
         # 激活层
         self.relu = nn.ReLU()
         # dropout层
-        self.dropout = nn.Dropout(p=0.1)
+        # self.dropout = nn.Dropout(p=0.1)
+        self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -134,7 +139,7 @@ class PolicyNet(nn.Module):
         self.actionHigh = torch.tensor(boundsNp[:, 1], dtype=torch.float32, device=self.device)  # (4,)
         self.actionRange = self.actionHigh - self.actionLow
         # 供 logProb 常数修正 ( (high-low)/2 )
-        self.logScaleConst = torch.log(self.actionRange / 2.0).sum()
+        # self.logScaleConst = torch.log(self.actionRange / 2.0).sum()
         """特征提取器"""
         # 深度相机特征提取器
         self.depthCameraFeatureExtractor = DepthCameraFeatureExtractor(self.cfg)
@@ -147,13 +152,16 @@ class PolicyNet(nn.Module):
         self.fc3 = nn.LazyLinear(out_features=256)
         self.fc4 = nn.LazyLinear(out_features=64)
         self.fcMu = nn.LazyLinear(out_features=4)  # 用于预测均值
-        self.fcStd = nn.LazyLinear(out_features=4)  # 用于预测方差
+        self.fcLogStd = nn.LazyLinear(out_features=4)  # 用于预测对数方差
         # 激活层
         self.relu = nn.ReLU()
         # dropout层
-        self.dropout = nn.Dropout(p=0.1)
+        # self.dropout = nn.Dropout(p=0.1)
+        self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
         # 放缩层
         self.scale = nn.Tanh()
+        # 将常数项注册为 buffer，确保随 .to() 迁移设备
+        self.register_buffer("logScaleConst", torch.log(self.actionRange / 2.0).sum())
 
     def forward(self, depthInformation: torch.Tensor, uavState: torch.Tensor) -> tuple:
         """
@@ -172,21 +180,26 @@ class PolicyNet(nn.Module):
         x = self.dropout(self.relu(self.fc2(x)))
         x = self.dropout(self.relu(self.fc3(x)))
         x = self.dropout(self.relu(self.fc4(x)))
-        mu = self.fcMu(x)  # 预测均值
-        std = F.softplus(self.fcStd(x))  # 预测方差
-        dist = Normal(mu, std)  # 正态分布
-        normalSample = dist.rsample()  # 重参数化采样
-        logProb = dist.log_prob(normalSample)  # 计算正态分布下的对数概率密度
-        # tanh 压缩
-        squashed = torch.tanh(normalSample)
-        # tanh 的 Jacobian 修正
-        logProb = logProb - torch.log(1 - squashed.pow(2) + 1e-7)
-        action = self.actionLow + ( (squashed + 1.0) * 0.5 ) * self.actionRange
-        # 线性缩放的对数概率再减常数项（不依赖 batch/N，每个样本相同，可广播）
-        logProb = logProb - self.logScaleConst
-        """计算tanh_normal分布的对数概率密度"""
-        # logProb = logProb - torch.log(1 - torch.tanh(action).pow(2) + 1e-7)
-        # action = action * self.actionBounds  # 放缩到动作空间
+        mu = self.fcMu(x)  # 预测均值 [B,N,A]
+        # 约束对数方差，防止方差过小/过大
+        logStd = torch.clamp(self.fcLogStd(x), min=-5.0, max=2.0)   # [B,N,A] 收紧下界，抑制过小方差
+        std = torch.exp(logStd)
+        # 非压缩高斯
+        dist = Normal(mu, std)
+        z = dist.rsample()                    # [B,N,A]
+        logProb = dist.log_prob(z)            # [B,N,A]
+        # tanh 压缩到 [-1,1]
+        squashed = torch.tanh(z)              # [B,N,A]
+        # tanh 的雅可比项：sum_over_A log(1 - tanh(z)^2)
+        logDetJacobian = torch.log(1 - squashed.pow(2) + 1e-6)  # [B,N,A]
+        # 在动作维上求和，得到标量对数概率 [B,N,1]
+        logProb = (logProb - logDetJacobian).sum(dim=-1, keepdim=True)
+        # 线性缩放到动作空间
+        action = self.actionLow + ((squashed + 1.0) * 0.5) * self.actionRange  # [B,N,A]
+        # 数值稳健：按边界再夹紧一次（支持逐维 Tensor 边界的广播）
+        # 线性缩放的对数概率修正：减去 sum log((high-low)/2)
+        action = torch.max(torch.min(action, self.actionHigh), self.actionLow)
+        logProb = logProb - self.logScaleConst  # [B,N,1]
         return action, logProb
     
 
@@ -220,7 +233,15 @@ class QValueNet(nn.Module):
         # 激活层
         self.relu = nn.ReLU()
         # dropout层
-        self.dropout = nn.Dropout(p=0.1)
+        # self.dropout = nn.Dropout(p=0.1)
+        self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
+        # 把动作边界注册为 buffer，便于将动作归一化到[-1,1]
+        boundsNp = np.array(self.cfg.env.actionBounds, dtype=np.float32)  # 形如 [[-1,1],...,[ -pi, pi ]]
+        actionLow = torch.tensor(boundsNp[:, 0], dtype=torch.float32)
+        actionHigh = torch.tensor(boundsNp[:, 1], dtype=torch.float32)
+        actionRange = actionHigh - actionLow
+        self.register_buffer("qActionLow", actionLow)         # [A]
+        self.register_buffer("qActionRange", actionRange)     # [A]
 
     def forward(self, depthInformation: torch.Tensor, uavState: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
@@ -233,8 +254,13 @@ class QValueNet(nn.Module):
         """特征提取"""
         x1 = self.depthCameraFeatureExtractor(depthInformation)
         x2 = self.trackFeatureExtractor(uavState)
+        # 新增：将动作缩放到[-1,1]，消除各维量纲差异（尤其 yaw）
+        # scaled = 2*(a - low)/range - 1
+        safeRange = torch.clamp(self.qActionRange, min=1e-6)
+        scaledAction = 2.0 * (action - self.qActionLow) / safeRange - 1.0
+        scaledAction = torch.clamp(scaledAction, -1.0, 1.0)
         """特征拼接"""
-        x = torch.cat([x1, x2, action], dim=2)
+        x = torch.cat([x1, x2, scaledAction], dim=2)
         """Q值网络"""
         x = self.dropout(self.relu(self.fc1(x)))
         x = self.dropout(self.relu(self.fc2(x)))
@@ -278,11 +304,9 @@ class SAC:
         self.criticScheduler1 = torch.optim.lr_scheduler.StepLR(self.criticOptimizer1, step_size=self.cfg.criticLearningRateDecayStep, gamma=self.cfg.criticLearningRateDecayGamma)
         self.criticScheduler2 = torch.optim.lr_scheduler.StepLR(self.criticOptimizer2, step_size=self.cfg.criticLearningRateDecayStep, gamma=self.cfg.criticLearningRateDecayGamma)
         # 使用alpha的log值，使得训练结果更稳定
-        # self.logAlpha = torch.tensor(np.log(self.cfg.alpha), dtype=torch.float)
-        # self.logAlpha.requires_grad = True  # 可以对其进行梯度计算
         self.logAlpha = torch.tensor(np.log(self.cfg.alpha), dtype=torch.float32, device=self.cfg.device, requires_grad=True)
         self.logAlphaOptimizer = torch.optim.Adam([self.logAlpha], lr=self.cfg.alphaLearningRate)  # 优化器
-        self.targetEntropy = self.cfg.targetEntity  # 目标熵
+        self.targetEntropy = float(getattr(self.cfg, "targetEntropy", -float(self.actionDim)))
         self.gamma = self.cfg.gamma  # 奖励折扣因子
         self.tau = self.cfg.tau  # soft update参数
         self.device = self.cfg.device  # 运行设备
@@ -348,21 +372,24 @@ class SAC:
         :param transitionDict: 转换字典，包含状态、动作、奖励、下一个状态和结束标志
         :return: None
         """
-        def _flt(lst):
-            return [x for x in lst if x is not None]
-
-        curStates     = _flt(transitionDict["states"])
-        nextStates    = _flt(transitionDict["nextStates"])
-        actions_raw   = _flt(transitionDict["actions"])
-        rewards_raw   = _flt(transitionDict["rewards"])
-        dones_raw     = _flt(transitionDict["dones"])
-        if len(curStates) == 0 or len(nextStates) == 0:
+        # 成对过滤，保持索引一致
+        paired = []
+        for s, a, r, ns, d in zip(transitionDict["states"],
+                                  transitionDict["actions"],
+                                  transitionDict["rewards"],
+                                  transitionDict["nextStates"],
+                                  transitionDict["dones"]):
+            if s is None or a is None or r is None or ns is None or d is None:
+                continue
+            paired.append((s, a, r, ns, d))
+        if not paired:
             return
+        curStates, actionsRaw, rewardsRaw, nextStates, dones_raw = map(list, zip(*paired))
         # 状态张量
         depthInformation, uavState = self._classified_information(curStates)          # [1,N,C,H,W] / [1,N,S]
         nextDepthInformation, nextUavState = self._classified_information(nextStates)
         # 动作 (N, actionDim)
-        actionsArr = np.array(actions_raw, dtype=np.float32)
+        actionsArr = np.array(actionsRaw, dtype=np.float32)
         if actionsArr.ndim == 1:
             # 单动作维度情况
             if self.actionDim == 1:
@@ -375,7 +402,7 @@ class SAC:
             print("[WARN] actions last dim mismatch:", actionsArr.shape, "expected", self.actionDim)
             return
         actions = torch.tensor(actionsArr, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,N,A]
-        rewardsArr = np.array(rewards_raw, dtype=np.float32).reshape(1, -1, 1)
+        rewardsArr = np.array(rewardsRaw, dtype=np.float32).reshape(1, -1, 1)
         donesArr   = np.array(dones_raw, dtype=np.float32).reshape(1, -1, 1)
         rewards = torch.tensor(rewardsArr, device=self.device)
         dones   = torch.tensor(donesArr, device=self.device)
@@ -402,13 +429,15 @@ class SAC:
         entropy = -logProb
         q1_new = self.critic1(depthInformation, uavState, newActions)
         q2_new = self.critic2(depthInformation, uavState, newActions)
-        actorLoss = torch.mean(-self.logAlpha.exp() * entropy - torch.min(q1_new, q2_new))
+        actorLoss = (self.logAlpha.exp() * logProb - torch.min(q1_new, q2_new)).mean()
+        lambdaA = float(getattr(self.cfg, "actorActionL2", 1e-3))
+        actorLoss = actorLoss + lambdaA * (newActions.pow(2).mean())
         self.actorOptimizer.zero_grad()
         actorLoss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
         self.actorOptimizer.step()
         # alpha
-        alphaLoss = torch.mean((entropy - self.targetEntropy).detach() * self.logAlpha.exp())
+        alphaLoss = -(self.logAlpha * (logProb + self.targetEntropy).detach()).mean()
         self.logAlphaOptimizer.zero_grad()
         alphaLoss.backward()
         self.logAlphaOptimizer.step()
@@ -445,9 +474,32 @@ class SAC:
         if depthNp.ndim == 3:
             # 补通道
             depthNp = depthNp[:, None, :, :]
+        # 固定量程归一化
+        if getattr(self.cfg, "normalizeDepth", True):
+            minD = float(getattr(self.cfg.env, "minDepthMeters", 0.1))
+            maxD = float(getattr(self.cfg.env, "maxDepthMeters", 100.0))
+            depthNp = np.clip(depthNp, minD, maxD)
+            depthNp = (depthNp - minD) / (maxD - minD + 1e-6)
         depthNp = np.nan_to_num(depthNp, nan=0.0, posinf=0.0, neginf=0.0)
         depthTensor = torch.tensor(depthNp, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,N,C,H,W]
         stateNp = np.stack(stateList, axis=0)
+        # 状态归一化（按照最大绝对值逐维缩放到[-1,1]）
+        if getattr(self.cfg, "normalizeState", True):
+            # 偏航角缩放到[-pi,pi]
+            stateNp[:, 3] = self._wrap_to_pi(stateNp[:, 3])
+            # 获取每一维度的最大绝对值
+            defaultMaxAbs = np.array([
+                float(getattr(self.cfg.env, "length", 100.0)),
+                float(getattr(self.cfg.env, "width", 100.0)),
+                float(getattr(self.cfg.env, "height", 50.0)),
+                np.pi
+            ], dtype=np.float32)
+            maxAbs = defaultMaxAbs
+            # 防止除零
+            maxAbs = np.clip(maxAbs, 1e-6, np.inf)
+            # 3) 逐维缩放并裁剪
+            stateNp = stateNp / maxAbs  # 每列除以对应最大绝对值
+            stateNp = np.clip(stateNp, -1.0, 1.0)
         stateNp = np.nan_to_num(stateNp, nan=0.0, posinf=0.0, neginf=0.0)
         stateTensor = torch.tensor(stateNp, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,N,S]
         if not torch.isfinite(depthTensor).all() or not torch.isfinite(stateTensor).all():
@@ -455,6 +507,14 @@ class SAC:
             depthTensor = torch.nan_to_num(depthTensor, nan=0.0, posinf=0.0, neginf=0.0)
             stateTensor = torch.nan_to_num(stateTensor, nan=0.0, posinf=0.0, neginf=0.0)
         return depthTensor, stateTensor
+    
+    def _wrap_to_pi(self, angleArray: np.ndarray) -> np.ndarray:
+        """
+        将角度数组包装到[-pi,pi]范围内
+        :param angleArray: 角度数组
+        :return: 包装后的角度数组
+        """
+        return ((angleArray + np.pi) % (2.0 * np.pi)) - np.pi
 
 if __name__ == "__main__":
     pass
