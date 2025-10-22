@@ -18,7 +18,7 @@ from navigation.scripts.SAC import SAC
 from uav.scripts.uav import UAVInfo
 from tools import ReplayBuffer, moving_average, epsilon_annealing
 from tools import save_checkPoint, load_checkPoint, cfg_get, to_plain_cfg, get_lr_safe
-from tools import set_gazebo_unlimit
+from tools import set_gazebo_unlimit, kill_gzclient, sigma_for_ep
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
@@ -41,6 +41,9 @@ def main(cfg) -> None:
     checkPointDir = cfg_get(cfg, "wandb.checkPointDir", "../checkPoints")
     checkPointPathConfig = cfg_get(cfg, "wandb.checkPointPath", "../checkPoints/kw9xf9k9.pt")
     saveEvery = int(cfg_get(cfg, "wandb.saveEvery", 10))
+    warmupEpisodes = int(cfg_get(cfg, "explore.warmupEpisodes", 10))
+    exploreSigma0 = float(cfg_get(cfg, "explore.sigma0", 0.2))
+    exploreSigmaT = float(cfg_get(cfg, "explore.sigmaT", 0.05))
     """初始化wandb运行"""
     if wbEnabled:
         wandb.init(
@@ -57,6 +60,9 @@ def main(cfg) -> None:
     navigationAlgorithm = SAC(cfg)  # 实例化路径规划算法
     replayBuffer = ReplayBuffer(cfg.bufferSize)  # 实例化经验回放缓冲区
     env = StaticObstacleEnv(cfg)  # 实例化环境
+    if not bool(cfg_get(cfg, "gazebo.gui", False)):
+        # 关闭gazebo headless客户端，防止渲染占用
+        kill_gzclient()
     time.sleep(2)  # 必要，等待环境内部资源初始化缓冲完成
     # gazebo加速相关
     turboEnabled = bool(cfg_get(cfg, "gazebo.turbo.enabled", True))
@@ -118,7 +124,24 @@ def main(cfg) -> None:
                     doneCount = 0  # 达到终止状态的无人机个数（包括达到目标点、发生碰撞、超出最大步长）
                     states = [state for state in states if state != None]  # 删除None状态
                     actions = navigationAlgorithm.take_action(states)  # 根据状态获取动作
-                    actions = np.array(actions)  # 转为numpy数组
+                    actions = np.array(actions, dtype=np.float32)  # 转为numpy数组
+                    # 探索：暖身期或全程加小噪声（按边界缩放）
+                    bounds = np.array(cfg.env.actionBounds, dtype=np.float32)  # (4,2)
+                    low, high = bounds[:,0], bounds[:,1]
+                    if episodeIndex < warmupEpisodes:
+                        # 完全随机
+                        rnd = np.random.uniform(low, high, size=actions.shape)
+                        actions = rnd
+                    else:
+                        # 高斯噪声
+                        sig = sigma_for_ep(episodeIndex, warmupEpisodes, exploreSigma0, exploreSigmaT, totalEpisodes)
+                        noise = np.random.normal(0.0, sig, size=actions.shape)
+                        # 将噪声映射到动作尺度（前三维[-1,1]直接加，yaw按[-pi,pi]尺度缩放）
+                        scale = high - low
+                        actions = actions + noise * (scale * 0.1)  # 0.1可调
+                    # 边界裁剪
+                    actions = np.clip(actions, low, high)
+                    print(f"[训练] 动作：{actions}")  # 打印动作
                     # 获取下一步的状态，奖励，是否完成
                     nextStates, rewards, dones = env.step(actions)
                     """存储数据"""
@@ -143,12 +166,17 @@ def main(cfg) -> None:
                     """将数据存入经验回放缓冲区"""
                     i = 0
                     # 根据state是否为None来判断是否完成
-                    for state in states:
+                    # for state in states:
+                    #     if state is None or nextStates[i] is None:
+                    #         continue
+                    #     else:
+                    #         replayBuffer.add(state, actions[i], rewards[i], nextStates[i], dones[i])
+                    #     i += 1
+                    # 与 actions/rewards/nextStates 索引严格对齐
+                    for i, state in enumerate(states):
                         if state is None or nextStates[i] is None:
-                            continue
-                        else:
-                            replayBuffer.add(state, actions[i], rewards[i], nextStates[i], dones[i])
-                        i += 1
+                            continue  # 若要保留终止样本，可在此构造零 nextState 写入
+                        replayBuffer.add(state, actions[i], rewards[i], nextStates[i], dones[i])
                     states = nextStates  # 更新状态
                 """迭代一次，更新网络"""
                 if replayBuffer.size() > cfg.minimalSize:
@@ -193,7 +221,7 @@ def main(cfg) -> None:
                     }
                     wandb.log(logData, step=episodeIndex)  #  wandb记录
                 """周期性保存checkPoint，并可上传为artifact"""
-                if (episodeIndex + 1) % max(1, saveEvery) == 0 or episodeIndex == totalEpisodes - 1:
+                if ((episodeIndex + 1) % max(1, saveEvery) == 0) or (episodeIndex == totalEpisodes - 1):
                     # 保存checkPoint
                     save_checkPoint(
                         latestCheckPointPath,
@@ -203,7 +231,7 @@ def main(cfg) -> None:
                         extraInfo={"wandb_run_id": wandb.run.id if wbEnabled and wandb.run else None}
                     )
                     # 保存快照
-                    if episodeIndex + 1 % 100 == 0:
+                    if ((episodeIndex + 1) % 100) == 0:
                         snapshotPath = os.path.join(checkPointDir, f"ep_{episodeIndex}.pt")
                         save_checkPoint(snapshotPath, episodeIndex, navigationAlgorithm, replayBuffer)
                     # 上传到wandb
@@ -211,10 +239,11 @@ def main(cfg) -> None:
                         try:
                             artifact = wandb.Artifact("sac-checkpoints", type="model")
                             artifact.add_file(latestCheckPointPath, name="latest.pt")
-                            artifact.add_file(snapshotPath, name=f"ep_{episodeIndex}.pt")
+                            if 'snapshotPath' in locals() and os.path.exists(snapshotPath) and (((episodeIndex + 1) % 100) == 0):
+                                artifact.add_file(snapshotPath, name=f"ep_{episodeIndex}.pt")
                             wandb.log_artifact(artifact)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"[wandb]上传checkPoint失败：{e}")
                 """打印每一步的训练信息"""
                 progressBar.set_postfix({
                     "episode": f"{episodeIndex}",
