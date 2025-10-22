@@ -13,6 +13,7 @@ import pickle
 from gazebo_msgs.srv import GetPhysicsProperties, SetPhysicsProperties
 from gazebo_msgs.msg import ModelStates
 import rospy
+import subprocess
 
 
 class ReplayBuffer:
@@ -177,9 +178,10 @@ def save_checkPoint(checkPointPath: str, episodeIndex: int, navigationAlgorithm,
     :return: None
     """
     os.makedirs(os.path.dirname(checkPointPath), exist_ok=True)
-    # 尝试序列化经验回放
+    # 尝试序列化经验回放(由于replayBuffer太占地方，因此不保存)
     try:
-        replayBufferBytes = pickle.dumps(replayBuffer)
+        # replayBufferBytes = pickle.dumps(replayBuffer)
+        replayBufferBytes = None
     except Exception:
         replayBufferBytes = None
     # 检查点状态
@@ -285,3 +287,29 @@ def set_gazebo_unlimit(maxWaitTime: int| float = 20, timeStep = None, targeModel
     except Exception as e:
         print(f"[gazebo] 设置失败：{e}")
         return False
+
+
+def kill_gzclient():
+    """关闭gazebo headless客户端"""
+    try:
+        subprocess.run(["pkill", "-f", "gzclient"], check=False)
+        print("[gazebo] gzclient 已关闭（headless）")
+    except Exception as e:
+        print(f"[gazebo] 关闭 gzclient 失败：{e}")
+
+
+def sigma_for_ep(ep, warmupEpisodes, exploreSigma0, exploreSigmaT, totalEpisodes):
+    """
+    获取当前episode的探索方差
+    :param ep: 当前episode
+    :param warmupEpisodes: 预热轮次
+    :param exploreSigma0: 初始探索噪声标准差
+    :param exploreSigmaT: 最终探索噪声标准差
+    :param totalEpisodes: 总轮次
+    :return: 当前episode的探索噪声标准差
+    """
+    if ep <= warmupEpisodes:
+        return exploreSigma0
+    T = max(1, totalEpisodes - warmupEpisodes)
+    k = min(1.0, max(0.0, (ep - warmupEpisodes) / T))
+    return (1 - k) * exploreSigma0 + k * exploreSigmaT
