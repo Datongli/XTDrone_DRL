@@ -1,6 +1,9 @@
 uav:
   # uav相关设置
   uavNums: 2
+  # 传感器类型设置
+  # sensorType: "iris_realsense_camera"
+  sensorType: "iris_2d_lidar"
   # 无人机初始化位置，目前只有y有用
   initPosition:
     x: 0
