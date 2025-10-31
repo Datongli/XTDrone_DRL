@@ -9,7 +9,7 @@ sensing/slam/vio/VINS-Fusion/camera_models/camera_calib_example
 .vscode
 .idea
 sensing/slam/vslam/evaluate
-test
+/test/
 DRL/build
 DRL/devel
 DRL/.catkin_tools
