@@ -72,7 +72,7 @@ class StaticObstacleEnv(gym.Env):
         rospy.loginfo("等待 Gazebo 服务启动...")
         self._wait_for_gazebo_services()
         """环境中的无人机集合"""
-        self.uavs: list[UAV] = [UAV(i) for i in range(self.uavNums)]
+        self.uavs: list[UAV] = [UAV(cfg, i) for i in range(self.uavNums)]
         """添加异步重置相关属性"""
         self.uavResetStates = [UAVResetState.NORMAL for _ in range(self.uavNums)]  # 无人机重置状态
         self.resetThreads = [None for _ in range(self.uavNums)]  # 重置线程
@@ -139,9 +139,10 @@ class StaticObstacleEnv(gym.Env):
         # 无人机信息采集
         uavInformations = []
         for uav in self.uavs:
-            depthInformation, uavState = self._uav_information_collection(uav)  # 深度相机信息和相对距离偏航角等
-            uavInformations.append({"depthInformation": depthInformation, "uavState": uavState})
-            uav.getInformation()  # 调试用
+            sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
+            uavInformations.append({"sensorData": sensorData, 
+                                    "uavState": uavState,
+                                    "uavZ": uav.currentPosition.z})
         rospy.loginfo("无人机信息采集完成")
         # 暂停gazebo物理仿真
         try:
@@ -197,10 +198,15 @@ class StaticObstacleEnv(gym.Env):
                rewards[i] = None
                continue
             # 获取无人机信息
-            depthInformation, uavState = self._uav_information_collection(uav)  # 深度相机信息和相对距离偏航角等
-            # 距离相机中障碍物的距离惩罚
-            if depthInformation is not None:
-                rewards[i] += - np.min(depthInformation) * 0.1
+            sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
+            if self.cfg.uav.sensorType == "iris_realsense_camera":
+                # 深度相机中障碍物的距离惩罚
+                if sensorData is not None:
+                    rewards[i] += -1 / (np.min(sensorData) + 1e-3) * 2
+            elif self.cfg.uav.sensorType == "iris_2d_lidar":
+                # 激光传感器中障碍物的距离惩罚
+                if sensorData is not None:
+                    rewards[i] += -1 / (np.min(sensorData) + 1e-3) * 2
             # 碰撞惩罚
             if uav.currentPosition.z >= self.height: 
                 uav.changeDone()
@@ -223,7 +229,9 @@ class StaticObstacleEnv(gym.Env):
                 rewards[i] += 1000
                 uav.info = UAVInfo.SUCCESS  # 将无人机信息设置为成功
                 uav.changeDone()
-            nextStates[i] = {"depthInformation": depthInformation, "uavState": uavState}
+            nextStates[i] = {"sensorData": sensorData, 
+                             "uavState": uavState,
+                             "uavZ": uav.currentPosition.z}
             dones[i] = uav.done
             # 将第一次done的无人机，归位，锁定，本轮不再起飞
             if uav.firstDone:
@@ -294,64 +302,69 @@ class StaticObstacleEnv(gym.Env):
         :param launchFile: launch文件路径
         :return: None
         """
-        """构造多无人机launch文件"""
-        # launch文件头
-        header = '''<launch>
-        <!--控制Gazobo UI是否开启的参数-->
-        <arg name="gui" value="true"/>
+        try:
+            """构造多无人机launch文件"""
+            # launch文件头
+            header = '''
+            <launch>
+            <!--控制Gazobo UI是否开启的参数-->
+            <arg name="gui" value="true"/>
 
-            <!--控制Gazebo开启-->
-            <include file="$(find env)/launch/empty_world.launch"/>
-        '''
-        groupTQL = '''
-        <!--iris_{i}-->
-        <group ns="iris_{i}">
-            <!--MAVROS配置-->
-                <arg name="ID" value="{i}"/>
-                <arg name="ID_in_group" value="{i}"/>
-                <arg name="fcu_url" default="udp://:{udpPort}@localhost:{gcsPort}"/>
-            <!--PX4 SITL以及无人机产生-->
-            <include file="$(find px4)/launch/single_vehicle_spawn_xtd.launch">
-                <arg name="x" value="{x}"/>
-                <arg name="y" value="{y}"/>
-                <arg name="z" value="{z}"/>
-                <arg name="R" value="{R}"/>
-                <arg name="P" value="{P}"/>
-                <arg name="Y" value="{Y}"/>
-                <arg name="vehicle" value="iris"/>
-                <arg name="sdf" value="iris_realsense_camera"/>
-                <arg name="mavlink_udp_port" value="{mavlinkUdpPort}"/>
-                <arg name="mavlink_tcp_port" value="{mavlinkTcpPort}"/>
-                <arg name="ID" value="$(arg ID)"/>
-                <arg name="ID_in_group" value="$(arg ID_in_group)"/>
-            </include>
-            <!--MAVROS-->
-            <include file="$(find mavros)/launch/px4.launch">
-                <arg name="fcu_url" value="$(arg fcu_url)"/>
-                <arg name="gcs_url" value=""/>
-                <arg name="tgt_system" value="$(eval 1 + arg('ID'))"/>
-                <arg name="tgt_component" value="1"/>
-            </include>
-        </group>
-        '''
-        footer = '</launch>\n'
-        with open(launchFile, 'w') as f:
-            f.write(header)
-            for i in range(self.uavNums):
-                f.write(groupTQL.format(
-                    i=i,
-                    udpPort=24540+i,
-                    gcsPort=34580+i,
-                    x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
-                    y=self.cfg.uav.initPosition.y,
-                    z=0.5,
-                    R=0.0,
-                    P=0.0,
-                    Y=math.pi/2,
-                    mavlinkUdpPort=18570+i,
-                    mavlinkTcpPort=4560+i,
-                ))
-            f.write(footer)
+                <!--控制Gazebo开启-->
+                <include file="$(find env)/launch/empty_world.launch"/>
+            '''
+            groupTQL = '''
+            <!--iris_{i}-->
+            <group ns="iris_{i}">
+                <!--MAVROS配置-->
+                    <arg name="ID" value="{i}"/>
+                    <arg name="ID_in_group" value="{i}"/>
+                    <arg name="fcu_url" default="udp://:{udpPort}@localhost:{gcsPort}"/>
+                <!--PX4 SITL以及无人机产生-->
+                <include file="$(find px4)/launch/single_vehicle_spawn_xtd.launch">
+                    <arg name="x" value="{x}"/>
+                    <arg name="y" value="{y}"/>
+                    <arg name="z" value="{z}"/>
+                    <arg name="R" value="{R}"/>
+                    <arg name="P" value="{P}"/>
+                    <arg name="Y" value="{Y}"/>
+                    <arg name="vehicle" value="iris"/>
+                    <arg name="sdf" value="{sensorType}"/>
+                    <arg name="mavlink_udp_port" value="{mavlinkUdpPort}"/>
+                    <arg name="mavlink_tcp_port" value="{mavlinkTcpPort}"/>
+                    <arg name="ID" value="$(arg ID)"/>
+                    <arg name="ID_in_group" value="$(arg ID_in_group)"/>
+                </include>
+                <!--MAVROS-->
+                <include file="$(find mavros)/launch/px4.launch">
+                    <arg name="fcu_url" value="$(arg fcu_url)"/>
+                    <arg name="gcs_url" value=""/>
+                    <arg name="tgt_system" value="$(eval 1 + arg('ID'))"/>
+                    <arg name="tgt_component" value="1"/>
+                </include>
+            </group>
+            '''
+            footer = '</launch>\n'
+            with open(launchFile, 'w') as f:
+                f.write(header)
+                for i in range(self.uavNums):
+                    f.write(groupTQL.format(
+                        i=i,
+                        udpPort=24540+i,
+                        gcsPort=34580+i,
+                        x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
+                        y=self.cfg.uav.initPosition.y,
+                        z=0.5,
+                        R=0.0,
+                        P=0.0,
+                        Y=math.pi/2,
+                        sensorType=self.cfg.uav.sensorType,
+                        mavlinkUdpPort=18570+i,
+                        mavlinkTcpPort=4560+i,
+                    ))
+                f.write(footer)
+        except Exception as e:
+            print(f"生成多无人机launch文件失败: {e}")
 
     def _wait_for_gazebo_services(self) -> None:
         """
@@ -675,13 +688,13 @@ class StaticObstacleEnv(gym.Env):
         """
         # 采集无人机信息
         uav.getInformation()
-        # 深度信息，无人机状态
-        depthInformation = uav.depthImage
+        # 传感器数据，无人机状态
+        sensorData = uav.sensorData
         uavState = [self.targets[uav.uavID].x - uav.currentPosition.x, 
                     self.targets[uav.uavID].y - uav.currentPosition.y, 
                     self.targets[uav.uavID].z - uav.currentPosition.z,
                     uav.currentYaw]
-        return depthInformation, uavState
+        return sensorData, uavState
 
     def _send_flight_termination(self, uav: UAV, enable: bool) -> None:
         """
