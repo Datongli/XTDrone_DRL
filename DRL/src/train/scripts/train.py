@@ -16,6 +16,7 @@ import numpy as np
 from env.scripts.env import StaticObstacleEnv
 from navigation.scripts.SAC import SAC
 from uav.scripts.uav import UAVInfo
+from hydra.utils import to_absolute_path
 from tools import ReplayBuffer, moving_average, epsilon_annealing
 from tools import save_checkPoint, load_checkPoint, cfg_get, to_plain_cfg, get_lr_safe
 from tools import set_gazebo_unlimit, kill_gzclient, sigma_for_ep
@@ -35,13 +36,14 @@ def main(cfg) -> None:
     wbEntity = cfg_get(cfg, "wandb.entity", "XTDrone-DRL-UAV-Navigation")
     wbName = cfg_get(cfg, "wandb.name", "navigation-training")
     wbMode = cfg_get(cfg, "wandb.mode", "online")
-    wbDir = cfg_get(cfg, "wandb.dir", "../wandb")
+    wbDirCfg = cfg_get(cfg, "wandb.dir", "./wandb")
+    wbDir = to_absolute_path(os.path.expandvars(wbDirCfg))
     wbId = cfg_get(cfg, "wandb.id", None)
     wbResumeFlag = cfg_get(cfg, "wandb.resumeFlag", True)
     checkPointDir = cfg_get(cfg, "wandb.checkPointDir", "../checkPoints")
     checkPointPathConfig = cfg_get(cfg, "wandb.checkPointPath", "../checkPoints/kw9xf9k9.pt")
     saveEvery = int(cfg_get(cfg, "wandb.saveEvery", 10))
-    warmupEpisodes = int(cfg_get(cfg, "explore.warmupEpisodes", 10))
+    warmupEpisodes = int(cfg_get(cfg, "explore.warmupEpisodes", 1))
     exploreSigma0 = float(cfg_get(cfg, "explore.sigma0", 0.2))
     exploreSigmaT = float(cfg_get(cfg, "explore.sigmaT", 0.05))
     """初始化wandb运行"""
@@ -70,9 +72,10 @@ def main(cfg) -> None:
     gazeboTurboApplied = False
     """wandb与checkPoint的整合"""
     # 准备checkPoint的存储目录
-    checkPointDir = os.path.abspath(os.path.join(os.getcwd(), checkPointDir))
+    checkPointDirCfg = cfg_get(cfg, "wandb.checkPointDir", "./checkPoints")
+    checkPointDir = to_absolute_path(os.path.expanduser(checkPointDirCfg))
     os.makedirs(checkPointDir, exist_ok=True)
-    latestCheckPointPath = os.path.join(checkPointDir, "latest.pt")  # 最新的pt文件
+    latestCheckPointPath = os.path.join(checkPointDir, "latest.pt")
     # 断点恢复
     startEpisodeIndex = 0  # 恢复的episode索引
     if wbResumeFlag:
@@ -165,13 +168,6 @@ def main(cfg) -> None:
                     overCount = statusCounters[UAVInfo.STEP_OVER]
                     """将数据存入经验回放缓冲区"""
                     i = 0
-                    # 根据state是否为None来判断是否完成
-                    # for state in states:
-                    #     if state is None or nextStates[i] is None:
-                    #         continue
-                    #     else:
-                    #         replayBuffer.add(state, actions[i], rewards[i], nextStates[i], dones[i])
-                    #     i += 1
                     # 与 actions/rewards/nextStates 索引严格对齐
                     for i, state in enumerate(states):
                         if state is None or nextStates[i] is None:
