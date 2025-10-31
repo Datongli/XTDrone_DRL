@@ -5,7 +5,7 @@ from uav.scripts.multirotor_communication import Communication
 import rospy
 import threading
 from geometry_msgs.msg import Pose
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, LaserScan
 from dataclasses import dataclass
 import numpy as np
 from enum import Enum
@@ -34,14 +34,42 @@ class UAVInfo(Enum):
     NORMAL = 3  # 正常状态
 
 
+@dataclass
+class SensorSpec:
+    """传感器订阅规格"""
+    topicTmpl: str  # 话题模板，使用{id}占位
+    msgType: object  # ROS 消息类型
+    callbackName: str  # UAV 实例上的回调方法名
+    queueSize: int = 2  # 订阅队列大小
+
+
 class UAV:
-    def __init__(self, uavID: int| float) -> None:
+
+    # 传感器注册表：配置名->规格
+    SENSOR_REGISTRY: dict[str, SensorSpec] ={
+        "iris_realsense_camera": SensorSpec(
+            topicTmpl="/iris_{id}/realsense/depth_camera/depth/image_raw",
+            msgType=Image,
+            callbackName="_depthImageCallback",
+            queueSize=2,
+        ),
+        "iris_2d_lidar": SensorSpec(
+            topicTmpl="/iris_{id}/scan",
+            msgType=LaserScan,
+            callbackName="_2dLidarCallback",
+            queueSize=2,
+        ),
+    }
+
+    def __init__(self, cfg, uavID: int| float) -> None:
         """
         构造函数
+        :param cfg: 配置文件
         :param uavID: 无人机ID
         :return: None
         """
         """无人机信息"""
+        self.cfg = cfg  # 配置文件
         self.uavID: int = uavID  # 无人机ID
         self.done: bool = False  # 终止状态
         self.info: UAVInfo = UAVInfo.NORMAL  # 无人机信息
@@ -54,13 +82,13 @@ class UAV:
         self.initPosition: Position = None  # 无人机起始位置
         self.currentPosition: Position = None  # 无人机当前位置（东北天坐标系下）
         self.currentYaw: float = None  # 无人机当前偏航角
-        self.depthImage: np.ndarray = None  # 无人机当前深度图像
+        self.sensorData: np.ndarray = None  # 无人机当前传感器数据
         self.depthImage8u: np.ndarray = None  # 可视化用的8位灰度图
         """相关话题、服务"""
         # 短期目标发布
         self.shotTargetPub = rospy.Publisher("/xtdrone/"+"iris"+'_'+str(self.uavID)+"/cmd_pose_enu", Pose, queue_size=3)
-        # 无人机深度相机数据获取
-        self.depthCameraSub = rospy.Subscriber("/iris_" + str(self.uavID) + "/realsense/depth_camera/depth/image_raw", Image, self._depthImageCallback ,queue_size=1)
+        # 创建无人机传感器数据获取客户端
+        self._setup_sensor_subscription()
     
     def getInformation(self) -> None:
         """
@@ -87,6 +115,29 @@ class UAV:
             self.done = True
         else:
             pass
+
+    def _setup_sensor_subscription(self) -> None:
+        """
+        按配置从注册表创建传感器订阅
+        :return: None
+        """
+        # 获取传感器类型
+        sensorType = self.cfg.uav.sensorType
+        sensor = self.SENSOR_REGISTRY.get(sensorType)  
+        # 检查传感器是否存在
+        if sensor is None:
+            rospy.logerr(f"UAV {self.uavID}: Unknown sensor type '{sensorType}'")
+            return
+        # 格式化话题名称
+        topicName = sensor.topicTmpl.format(id=self.uavID)
+        # 获取回调方法
+        callback = getattr(self, sensor.callbackName, None)
+        if callback is None:
+            rospy.logerr(f"UAV {self.uavID}: Unknown sensor callback '{sensor.callbackName}'")
+            return
+        # 创建传感器订阅
+        self.sensorSub = rospy.Subscriber(topicName, sensor.msgType, callback, queue_size=sensor.queueSize)
+
 
     def _depthImageCallback(self, depthImage: Image) -> None:
         """
@@ -141,7 +192,7 @@ class UAV:
             # 如果整帧都无效：保留上一帧，避免把全 NaN/全 0 注入状态与奖励
             finiteMask = np.isfinite(depthArray)
             if not np.any(finiteMask):
-                if self.depthImage is not None:
+                if self.sensorData is not None:
                     rospy.logwarn_throttle(5.0, "Depth frame has no valid pixels; keeping previous depthImage")
                     return
                 # 没有上一帧则安全回退为全 0（可按需求替换为相机最大量程）
@@ -151,7 +202,7 @@ class UAV:
                 finiteMax = np.nanmax(depthArray)
                 depthArray = np.where(finiteMask, depthArray, finiteMax)
             # 保存用于训练/奖励的无 NaN 深度（米）
-            self.depthImage = depthArray
+            self.sensorData = depthArray
             # 生成可视化 8-bit 灰度图：线性归一化到 [0,255]，并避免除零
             depthMin = float(np.min(depthArray))
             depthMax = float(np.max(depthArray))
@@ -163,6 +214,28 @@ class UAV:
         except Exception as error:
             # 节流打印避免刷屏
             rospy.logwarn_throttle(5.0, f"Depth callback error: {error}")
+
+
+    def _2dLidarCallback(self, lidarScan: LaserScan) -> None:
+        """
+        激光雷达数据回调函数
+        :param lidarScan: 激光雷达扫描数据
+        :return: None
+        """
+        try:
+            """获取2d激光雷达数据"""
+            # 激光雷达数据范围
+            rangeMin = lidarScan.range_min
+            rangeMax = lidarScan.range_max
+            # 激光雷达数据
+            ranges = np.array(lidarScan.ranges)
+            """处理2d激光雷达数据"""
+            # 对inf的数据进行替换为rangeMax
+            ranges = np.where(np.isinf(ranges), rangeMax, ranges)
+            self.sensorData = ranges
+        except Exception as error:
+            # 节流打印避免刷屏
+            rospy.logwarn_throttle(5.0, f"Lidar callback error: {error}")
 
 
 if __name__ == "__main__":
