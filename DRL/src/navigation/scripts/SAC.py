@@ -6,14 +6,14 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
+import copy
 
 
 class DepthCameraFeatureExtractor(nn.Module):
     """
     深度相机特征提取器
-    现在主要使用卷积网络提取深度相机特征
     """
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg=None) -> None:
         """
         构造函数
         :param cfg: 配置
@@ -22,8 +22,6 @@ class DepthCameraFeatureExtractor(nn.Module):
         super().__init__()
         """可能需要的参数"""
         self.cfg = cfg
-        """特征预处理部分"""
-        # 有可能需要在这里添加一些预处理
         """网络层"""
         # 卷积层
         self.conv1 = nn.LazyConv2d(out_channels=4, kernel_size=[4, 4], stride=[2, 2], padding=[1, 1])
@@ -74,11 +72,11 @@ class DepthCameraFeatureExtractor(nn.Module):
         return x
         
 
-class TrackFeatureExtractor(nn.Module):
+class LidarFeatureExtractor2D(nn.Module):
     """
-    轨迹特征提取器
+    2D激光雷达特征提取器
     """
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg=None) -> None:
         """
         构造函数
         :param cfg: 配置
@@ -87,8 +85,64 @@ class TrackFeatureExtractor(nn.Module):
         super().__init__()
         """可能需要的参数"""
         self.cfg = cfg
-        """特征预处理部分"""
-        # 有可能需要在这里添加一些预处理
+        """网络层"""
+        # 卷积层
+        self.conv1 = nn.LazyConv1d(out_channels=32, kernel_size=9, stride=2, padding=4)
+        self.conv2 = nn.LazyConv1d(out_channels=64, kernel_size=7, stride=2, padding=3)
+        self.conv3 = nn.LazyConv1d(out_channels=128, kernel_size=5, stride=2, padding=2)
+        self.conv4 = nn.LazyConv1d(out_channels=128, kernel_size=3, stride=1, padding=1)
+        # 激活层
+        self.relu = nn.ReLU()
+        # 归一化层
+        self.bn1 = nn.Identity()
+        self.bn2 = nn.Identity()
+        self.bn3 = nn.Identity()
+        self.bn4 = nn.Identity()
+        # 池化层
+        self.globalPool = nn.AdaptiveAvgPool1d(1)  # 全局平均池化
+        # 线性层
+        self.fc1 = nn.LazyLinear(out_features=256)
+        self.fc2 = nn.LazyLinear(out_features=128)
+        self.fc3 = nn.LazyLinear(out_features=64)
+        self.fc4 = nn.LazyLinear(out_features=64)
+        # dropout层
+        # self.dropout = nn.Dropout(p=0.5)
+        self.dropout = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        :param x: 输入张量
+        :return: 输出张量
+        """
+        B, N, C, L = x.shape
+        x = x.view(B * N, C, L)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = self.relu(self.bn4(self.conv4(x)))
+        x = self.globalPool(x).squeeze(-1)
+        x = self.dropout(self.relu(self.fc1(x)))
+        x = self.dropout(self.relu(self.fc2(x)))
+        x = self.dropout(self.relu(self.fc3(x)))
+        x = self.fc4(x)
+        x = x.view(B, N, -1)
+        return x
+
+
+class TrackFeatureExtractor(nn.Module):
+    """
+    轨迹特征提取器
+    """
+    def __init__(self, cfg=None) -> None:
+        """
+        构造函数
+        :param cfg: 配置
+        :return: None
+        """
+        super().__init__()
+        """可能需要的参数"""
+        self.cfg = cfg
         """网络层"""
         # 全连接层
         self.fc1 = nn.LazyLinear(out_features=4)
@@ -119,6 +173,12 @@ class TrackFeatureExtractor(nn.Module):
         return x
 
 
+# 传感器提取器注册表
+SENSOR_FEATURE_EXTRACTOR = {
+        "iris_realsense_camera": DepthCameraFeatureExtractor(),
+        "iris_2d_lidar": LidarFeatureExtractor2D(),
+    }
+
 class PolicyNet(nn.Module):
     """
     策略网络
@@ -141,8 +201,11 @@ class PolicyNet(nn.Module):
         # 供 logProb 常数修正 ( (high-low)/2 )
         # self.logScaleConst = torch.log(self.actionRange / 2.0).sum()
         """特征提取器"""
-        # 深度相机特征提取器
-        self.depthCameraFeatureExtractor = DepthCameraFeatureExtractor(self.cfg)
+        # 传感器特征提取器，深拷贝以避免共享参数
+        baseExtractor = SENSOR_FEATURE_EXTRACTOR.get(self.cfg.uav.sensorType)
+        if baseExtractor is None:
+            raise ValueError(f"未知的传感器类型: {self.cfg.uav.sensorType}. 可用: {list(SENSOR_FEATURE_EXTRACTOR.keys())}")
+        self.sensorFeatureExtractor = copy.deepcopy(baseExtractor)
         # 轨迹特征提取器
         self.trackFeatureExtractor = TrackFeatureExtractor(self.cfg)
         """网络层"""
@@ -163,15 +226,15 @@ class PolicyNet(nn.Module):
         # 将常数项注册为 buffer，确保随 .to() 迁移设备
         self.register_buffer("logScaleConst", torch.log(self.actionRange / 2.0).sum())
 
-    def forward(self, depthInformation: torch.Tensor, uavState: torch.Tensor) -> tuple:
+    def forward(self, sensorData: torch.Tensor, uavState: torch.Tensor) -> tuple:
         """
         前行传播
-        :param depthInformation: 深度信息
+        :param sensorData: 传感器数据
         :param uavState: UAV状态
         :return: 动作和对数概率密度
         """
-        """分别计算无人机的深度信息特征和无人机状态特征"""
-        x1 = self.depthCameraFeatureExtractor(depthInformation)
+        """分别计算无人机的传感器特征和无人机状态特征"""
+        x1 = self.sensorFeatureExtractor(sensorData)
         x2 = self.trackFeatureExtractor(uavState)
         """特征拼接"""
         x = torch.cat([x1, x2], dim=2)
@@ -217,9 +280,11 @@ class QValueNet(nn.Module):
         """可能需要的参数"""
         self.cfg = cfg
         """特征提取器"""
-        # 深度相机特征提取器
-        self.depthCameraFeatureExtractor = DepthCameraFeatureExtractor(self.cfg)
-        # 轨迹特征提取器
+        # 传感器特征提取器，深拷贝以避免共享参数
+        baseExtractor = SENSOR_FEATURE_EXTRACTOR.get(self.cfg.uav.sensorType)
+        if baseExtractor is None:
+            raise ValueError(f"未知的传感器类型: {self.cfg.uav.sensorType}. 可用: {list(SENSOR_FEATURE_EXTRACTOR.keys())}")
+        self.sensorFeatureExtractor = copy.deepcopy(baseExtractor)
         self.trackFeatureExtractor = TrackFeatureExtractor(self.cfg)
         """网络层"""
         self.fc1 = nn.LazyLinear(out_features=64)
@@ -243,16 +308,16 @@ class QValueNet(nn.Module):
         self.register_buffer("qActionLow", actionLow)         # [A]
         self.register_buffer("qActionRange", actionRange)     # [A]
 
-    def forward(self, depthInformation: torch.Tensor, uavState: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def forward(self, sensorData: torch.Tensor, uavState: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
         前向传播
-        :param depthInformation: 深度信息
+        :param sensorData: 传感器数据
         :param uavState: UAV状态
         :param action: 动作
         :return: Q值
         """
         """特征提取"""
-        x1 = self.depthCameraFeatureExtractor(depthInformation)
+        x1 = self.sensorFeatureExtractor(sensorData)
         x2 = self.trackFeatureExtractor(uavState)
         # 新增：将动作缩放到[-1,1]，消除各维量纲差异（尤其 yaw）
         # scaled = 2*(a - low)/range - 1
@@ -292,6 +357,13 @@ class SAC:
         # 两个目标动作价值网络
         self.targetCritic1 = QValueNet(cfg).to(self.cfg.device)
         self.targetCritic2 = QValueNet(cfg).to(self.cfg.device)
+        self.networks = {
+            "actor": self.actor,
+            "critic1": self.critic1,
+            "critic2": self.critic2,
+            "targetCritic1": self.targetCritic1,
+            "targetCritic2": self.targetCritic2,
+        }
         """模型参数相关"""
         self.targetCritic1.load_state_dict(self.critic1.state_dict())
         self.targetCritic2.load_state_dict(self.critic2.state_dict())
@@ -322,18 +394,15 @@ class SAC:
         if len(valid) == 0:
             return []
         # 提取状态
-        depthInformation, uavState = self._classified_information(valid)
-        # 检测数据中是否含有NaN
-        if torch.isnan(depthInformation).any(): print("depth NaN")
-        if torch.isnan(uavState).any(): print("state NaN")
+        sensorData, uavState = self._classified_information(valid)
         # 选择动作
-        actions, _ = self.actor(depthInformation, uavState)
+        actions, _ = self.actor(sensorData, uavState)
         if torch.isnan(actions).any() or torch.isinf(actions).any():
             print("[WARN] actions contain NaN/Inf, returning zeros")
             actions = torch.nan_to_num(actions, nan=0.0, posinf=0.0, neginf=0.0)
         return actions[0].detach().cpu().numpy()
     
-    def calculate_target(self, rewards: int | float, depthInformation: torch.Tensor, uavState: torch.Tensor, dones: list) -> float | int:
+    def calculate_target(self, rewards: int | float, sensorData: torch.Tensor, uavState: torch.Tensor, dones: list) -> float | int:
         """
         计算目标Q值
         :param rewards: 奖励
@@ -344,12 +413,12 @@ class SAC:
         """
         with torch.no_grad():
             # 计算下一动作和概率
-            nextActions, logProb = self.actor(depthInformation, uavState)
+            nextActions, logProb = self.actor(sensorData, uavState)
             # 熵
             entropy = -logProb
             # 获取两个动作价值网络输出
-            q1Value = self.targetCritic1(depthInformation, uavState, nextActions)
-            q2Value = self.targetCritic2(depthInformation, uavState, nextActions)
+            q1Value = self.targetCritic1(sensorData, uavState, nextActions)
+            q2Value = self.targetCritic2(sensorData, uavState, nextActions)
             # 取较小的Q值
             nextVaule = torch.min(q1Value, q2Value) + self.logAlpha.exp() * entropy
             # 计算时序差分目标
@@ -449,64 +518,135 @@ class SAC:
         """
         分类无人机信息
         :param uavInformations: UAV信息，包含深度信息和UAV状态
-        :return: 深度信息，UAV状态
-        depthInformation: [1,N,1,H,W]
-        uavState:         [1,N,S]
+        :return: 传感器数据，UAV状态
+        深度相机 -> [1, N, 1, H, W]
+        2D雷达   -> [1, N, 1, L]
+        UAV状态 -> [1, N, S]
         """
-        depthList = []
-        stateList = []
-        for info in uavInformations:
-            if info is None or not isinstance(info, dict):
+        # 1) 成对过滤，确保每个条目同时具有传感器数据与UAV状态，保证索引对齐
+        pairedList = []
+        for informationItem in uavInformations:
+            if not informationItem or not isinstance(informationItem, dict):
                 continue
-            d = info.get("depthInformation", None)
-            s = info.get("uavState", None)
-            if d is not None:
-                d = np.asarray(d, dtype=np.float32)
-                d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
-                depthList.append(d)
-            if s is not None:
-                s = np.asarray(s, dtype=np.float32)
-                s = np.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0)
-                stateList.append(s)
-        if len(depthList) == 0 or len(stateList) == 0:
-            raise ValueError(f"_classified_information empty depth={len(depthList)} state={len(stateList)}")
-        depthNp = np.stack(depthList, axis=0)  # [N,...]
-        if depthNp.ndim == 3:
-            # 补通道
-            depthNp = depthNp[:, None, :, :]
-        # 固定量程归一化
-        if getattr(self.cfg, "normalizeDepth", True):
-            minD = float(getattr(self.cfg.env, "minDepthMeters", 0.1))
-            maxD = float(getattr(self.cfg.env, "maxDepthMeters", 100.0))
-            depthNp = np.clip(depthNp, minD, maxD)
-            depthNp = (depthNp - minD) / (maxD - minD + 1e-6)
-        depthNp = np.nan_to_num(depthNp, nan=0.0, posinf=0.0, neginf=0.0)
-        depthTensor = torch.tensor(depthNp, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,N,C,H,W]
-        stateNp = np.stack(stateList, axis=0)
-        # 状态归一化（按照最大绝对值逐维缩放到[-1,1]）
+            sensorDataRaw = informationItem.get("sensorData", None)  
+            uavStateRaw = informationItem.get("uavState", None)
+            if sensorDataRaw is None or uavStateRaw is None:
+                continue
+            pairedList.append((sensorDataRaw, uavStateRaw))
+        if not pairedList:
+            raise ValueError("_classified_information: empty inputs")
+        sensorDataList, uavStateList = map(list, zip(*pairedList))
+        # 2) 传感器数据预处理（自动或按配置识别雷达/相机）
+        # 先转为对象数组以保留各自形状便于探测
+        sensorObjectArray = np.asarray(sensorDataList, dtype=object)
+        # 将每个元素都标准化为 float32 的 ndarray
+        sensorNumpyList = []
+        for arrayItem in sensorObjectArray:
+            arrayItem = np.asarray(arrayItem, dtype=np.float32)
+            sensorNumpyList.append(arrayItem)
+        # 尝试直接堆叠；若形状不一致（如有些是 [L] 有些是 [1,L]），做一次修正后再堆叠
+        try:
+            sensorNumpyArray = np.stack(sensorNumpyList, axis=0)
+        except Exception:
+            fixedList = []
+            for arrayItem in sensorNumpyList:
+                # 兼容常见雷达形状 [1,L] 或 [L,1] -> 展平成 [L]
+                if arrayItem.ndim == 2 and (arrayItem.shape[0] == 1 or arrayItem.shape[1] == 1):
+                    arrayItem = arrayItem.reshape(-1)
+                fixedList.append(arrayItem)
+            sensorNumpyArray = np.stack(fixedList, axis=0)
+        # 按配置优先判断传感器类型；未配置时再用形状启发式判定
+        sensorTypeString = str(getattr(getattr(self.cfg, "uav", None), "sensorType", "")).lower()
+        isLidar = ("lidar" in sensorTypeString)
+        if not isLidar:
+            # 形状启发：
+            # - 雷达常见形状: [N, L] 或 [N, 1, L]
+            # - 相机常见形状: [N, H, W] 或 [N, C, H, W]
+            if sensorNumpyArray.ndim == 2:
+                isLidar = True
+            elif sensorNumpyArray.ndim == 3 and sensorNumpyArray.shape[1] == 1 and sensorNumpyArray.shape[-1] >= 16:
+                isLidar = True
+            else:
+                isLidar = False
+        if isLidar:
+            # 2D 雷达分支
+            # 目标张量形状: [1, N, 1, L]
+            # 步骤:
+            # - 统一形状到 [N, 1, L]
+            # - 将无效值（NaN/Inf）替换为物理合理范围
+            # - 使用[minLidarMeters, maxLidarMeters]将距离线性缩放到[0,1]
+            if sensorNumpyArray.ndim == 1:
+                sensorNumpyArray = sensorNumpyArray[None, ...]  # [N, L]
+            if sensorNumpyArray.ndim == 2:
+                sensorNumpyArray = sensorNumpyArray[:, None, :]  # [N, 1, L]
+            elif sensorNumpyArray.ndim == 3:
+                # 若形如 [N, L, 1] 则转成 [N, 1, L]
+                if sensorNumpyArray.shape[1] != 1 and sensorNumpyArray.shape[2] == 1:
+                    sensorNumpyArray = sensorNumpyArray[:, :, 0][:, None, :]
+                elif sensorNumpyArray.shape[1] != 1 and sensorNumpyArray.shape[2] != 1:
+                    raise ValueError(f"Unexpected lidar shape: {sensorNumpyArray.shape}")
+            minRangeMeters = float(getattr(self.cfg.env, "minLidarMeters",
+                                           getattr(self.cfg.env, "minDepthMeters", 0.5)))
+            maxRangeMeters = float(getattr(self.cfg.env, "maxLidarMeters",
+                                           getattr(self.cfg.env, "maxDepthMeters", 20.0)))
+            # 替换无效值 -> 裁剪到量程 -> 线性缩放到[0,1]
+            sensorNumpyArray = np.nan_to_num(sensorNumpyArray,
+                                             nan=maxRangeMeters, posinf=maxRangeMeters, neginf=minRangeMeters)
+            sensorNumpyArray = np.clip(sensorNumpyArray, minRangeMeters, maxRangeMeters)
+            sensorNumpyArray = (sensorNumpyArray - minRangeMeters) / (maxRangeMeters - minRangeMeters + 1e-6)
+            sensorTensor = torch.tensor(sensorNumpyArray, dtype=torch.float32, device=self.device).unsqueeze(0)
+        else:
+            # 深度相机分支
+            # 目标张量形状: [1, N, 1, H, W]（若已有多通道则为 [1, N, C, H, W]）
+            # 步骤:
+            # - 若为 [N, H, W]，补通道为 [N, 1, H, W]
+            # - 将无效值（NaN/Inf）替换为物理合理范围
+            # - 使用[minDepthMeters, maxDepthMeters]将深度线性缩放到[0,1]
+            if sensorNumpyArray.ndim == 3:
+                sensorNumpyArray = sensorNumpyArray[:, None, :, :]  # [N, 1, H, W]
+            elif sensorNumpyArray.ndim != 4:
+                raise ValueError(f"Unexpected camera shape: {sensorNumpyArray.shape}")
+            minDepthMeters = float(getattr(self.cfg.env, "minDepthMeters", 0.1))
+            maxDepthMeters = float(getattr(self.cfg.env, "maxDepthMeters", 50.0))
+            sensorNumpyArray = np.nan_to_num(sensorNumpyArray,
+                                             nan=maxDepthMeters, posinf=maxDepthMeters, neginf=minDepthMeters)
+            sensorNumpyArray = np.clip(sensorNumpyArray, minDepthMeters, maxDepthMeters)
+            sensorNumpyArray = (sensorNumpyArray - minDepthMeters) / (maxDepthMeters - minDepthMeters + 1e-6)
+            sensorTensor = torch.tensor(sensorNumpyArray, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # 3) UAV 状态预处理
+        # 目标张量形状: [1, N, S]
+        # 步骤:
+        # - 堆叠为 [N, S]
+        # - 若启用 normalizeState:
+        #   * 将偏航角包裹到[-pi, pi]
+        #   * 按环境尺度 [length, width, height, pi] 逐维缩放到[-1,1]
+        #   * 若状态维度 > 4，额外维度用1作为缩放（避免除零/未知量纲）
+        stateNumpyArray = np.stack([np.asarray(uavState, dtype=np.float32) for uavState in uavStateList], axis=0)
         if getattr(self.cfg, "normalizeState", True):
-            # 偏航角缩放到[-pi,pi]
-            stateNp[:, 3] = self._wrap_to_pi(stateNp[:, 3])
-            # 获取每一维度的最大绝对值
-            defaultMaxAbs = np.array([
+            if stateNumpyArray.shape[1] >= 4:
+                stateNumpyArray[:, 3] = self._wrap_to_pi(stateNumpyArray[:, 3])
+            defaultMaxAbsArray = np.array([
                 float(getattr(self.cfg.env, "length", 100.0)),
                 float(getattr(self.cfg.env, "width", 100.0)),
                 float(getattr(self.cfg.env, "height", 50.0)),
                 np.pi
             ], dtype=np.float32)
-            maxAbs = defaultMaxAbs
-            # 防止除零
-            maxAbs = np.clip(maxAbs, 1e-6, np.inf)
-            # 3) 逐维缩放并裁剪
-            stateNp = stateNp / maxAbs  # 每列除以对应最大绝对值
-            stateNp = np.clip(stateNp, -1.0, 1.0)
-        stateNp = np.nan_to_num(stateNp, nan=0.0, posinf=0.0, neginf=0.0)
-        stateTensor = torch.tensor(stateNp, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,N,S]
-        if not torch.isfinite(depthTensor).all() or not torch.isfinite(stateTensor).all():
+            if stateNumpyArray.shape[1] > 4:
+                extraScaleArray = np.ones((stateNumpyArray.shape[1] - 4,), dtype=np.float32)
+                maxAbsArray = np.concatenate([defaultMaxAbsArray, extraScaleArray], axis=0)
+            else:
+                maxAbsArray = defaultMaxAbsArray[: stateNumpyArray.shape[1]]
+            maxAbsArray = np.clip(maxAbsArray, 1e-6, np.inf)
+            stateNumpyArray = stateNumpyArray / maxAbsArray
+            stateNumpyArray = np.clip(stateNumpyArray, -1.0, 1.0)
+        stateNumpyArray = np.nan_to_num(stateNumpyArray, nan=0.0, posinf=0.0, neginf=0.0)
+        stateTensor = torch.tensor(stateNumpyArray, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # 4) 数值安全校验：如仍存在非有限数，做兜底替换
+        if not torch.isfinite(sensorTensor).all() or not torch.isfinite(stateTensor).all():
             print("[WARN] Non-finite in inputs -> sanitized")
-            depthTensor = torch.nan_to_num(depthTensor, nan=0.0, posinf=0.0, neginf=0.0)
+            sensorTensor = torch.nan_to_num(sensorTensor, nan=0.0, posinf=0.0, neginf=0.0)
             stateTensor = torch.nan_to_num(stateTensor, nan=0.0, posinf=0.0, neginf=0.0)
-        return depthTensor, stateTensor
+        return sensorTensor, stateTensor
     
     def _wrap_to_pi(self, angleArray: np.ndarray) -> np.ndarray:
         """
