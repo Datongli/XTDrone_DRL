@@ -1,0 +1,28 @@
+<sdf version="1.5">
+  <model name="target_sphere">
+    <static>true</static>
+    <link name="link">
+      <visual name="visual">
+        <geometry>
+          <sphere>
+            <radius>{radius}</radius>
+          </sphere>
+        </geometry>
+        <material>
+          <ambient>1 0 0 1</ambient>
+          <diffuse>1 0 0 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+          <emissive>0.5 0 0 1</emissive>
+        </material>
+        <transparency>0.3</transparency>
+      </visual>
+      <collision name="collision">
+        <geometry>
+          <sphere>
+            <radius>{radius}</radius>
+          </sphere>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>
