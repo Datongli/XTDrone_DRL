@@ -4,11 +4,12 @@
 from uav.scripts.multirotor_communication import Communication
 import rospy
 import threading
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import Image, LaserScan
 from dataclasses import dataclass
 import numpy as np
 from enum import Enum
+import subprocess
 
 
 @dataclass
@@ -32,6 +33,8 @@ class UAVInfo(Enum):
     COLLISION = 1  # 发生碰撞
     STEP_OVER = 2  # 超出最大步长
     NORMAL = 3  # 正常状态
+    LANDING = 4  # 降落中
+    LANDED = 5  # 已降落
 
 
 @dataclass
@@ -54,6 +57,12 @@ class UAV:
             queueSize=2,
         ),
         "iris_2d_lidar": SensorSpec(
+            topicTmpl="/iris_{id}/scan",
+            msgType=LaserScan,
+            callbackName="_2dLidarCallback",
+            queueSize=2,
+        ),
+        "iris_2d_lidar_and_downward_camera": SensorSpec(
             topicTmpl="/iris_{id}/scan",
             msgType=LaserScan,
             callbackName="_2dLidarCallback",
@@ -84,9 +93,17 @@ class UAV:
         self.currentYaw: float = None  # 无人机当前偏航角
         self.sensorData: np.ndarray = None  # 无人机当前传感器数据
         self.depthImage8u: np.ndarray = None  # 可视化用的8位灰度图
+        self.lastDistanceToTarget: float = None  # 上一次距离目标的距离
+        self.velocity: np.array = np.zeros(3, dtype=np.float32)  # 当前时刻的速度
+        self.isLanding: bool = False  # 是否正在降落
+        self.landingStartTime: int | float = None  # 降落开始时间
+        self.landingTimeout: int | float = 60.0  # 降落超时时间，单位：秒
+        self.landingProcesses: list[subprocess.Popen] = []  # 降落相关进程
         """相关话题、服务"""
         # 短期目标发布
         self.shotTargetPub = rospy.Publisher("/xtdrone/"+"iris"+'_'+str(self.uavID)+"/cmd_pose_enu", Pose, queue_size=3)
+        # 无人机gazebo中真实位置订阅
+        self.gazeboPositionSub = rospy.Subscriber("iris_" + str(self.uavID) + "/mavros/vision_pose/pose", PoseStamped, self._gazeboPositionCallback, queue_size=1)
         # 创建无人机传感器数据获取客户端
         self._setup_sensor_subscription()
     
@@ -138,6 +155,13 @@ class UAV:
         # 创建传感器订阅
         self.sensorSub = rospy.Subscriber(topicName, sensor.msgType, callback, queue_size=sensor.queueSize)
 
+    def _gazeboPositionCallback(self, pose: PoseStamped) -> None:
+        """
+        Gazebo中无人机真实位置回调
+        :param pose: 位置
+        :return: None
+        """
+        uavGazeboPose = pose.pose
 
     def _depthImageCallback(self, depthImage: Image) -> None:
         """
@@ -215,7 +239,6 @@ class UAV:
             # 节流打印避免刷屏
             rospy.logwarn_throttle(5.0, f"Depth callback error: {error}")
 
-
     def _2dLidarCallback(self, lidarScan: LaserScan) -> None:
         """
         激光雷达数据回调函数
@@ -236,6 +259,27 @@ class UAV:
         except Exception as error:
             # 节流打印避免刷屏
             rospy.logwarn_throttle(5.0, f"Lidar callback error: {error}")
+
+    def __del__(self) -> None:
+        """
+        析构函数
+        """
+        if hasattr(self, "landingProcesses"):
+            self._clean_up_process()
+
+    def _clean_up_process(self) -> None:
+        """
+        清理所有进程
+        :return: None
+        """
+        for process in getattr(self, "landingProcesses", []):
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except Exception as e:
+                rospy.logerr(f"清理进程失败：{e}")
 
 
 if __name__ == "__main__":
