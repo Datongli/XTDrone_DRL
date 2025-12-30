@@ -41,7 +41,7 @@ def main(cfg) -> None:
     wbId = cfg_get(cfg, "wandb.id", None)
     wbResumeFlag = cfg_get(cfg, "wandb.resumeFlag", True)
     checkPointDir = cfg_get(cfg, "wandb.checkPointDir", "../checkPoints")
-    checkPointPathConfig = cfg_get(cfg, "wandb.checkPointPath", "../checkPoints/kw9xf9k9.pt")
+    checkPointPathConfig = cfg_get(cfg, "wandb.checkPointPath", "../checkPoints/kw9xf9k8.pt")
     saveEvery = int(cfg_get(cfg, "wandb.saveEvery", 10))
     warmupEpisodes = int(cfg_get(cfg, "explore.warmupEpisodes", 1))
     exploreSigma0 = float(cfg_get(cfg, "explore.sigma0", 0.2))
@@ -175,7 +175,7 @@ def main(cfg) -> None:
                         replayBuffer.add(state, actions[i], rewards[i], nextStates[i], dones[i])
                     states = nextStates  # 更新状态
                 """迭代一次，更新网络"""
-                if replayBuffer.size() > cfg.minimalSize:
+                if replayBuffer.size() > getattr(cfg, "minimalSize", 32):
                     batchStates, batchActions, batchRewards, batchNextStates, batchDones = replayBuffer.sample(cfg.batchSize)
                     navigationAlgorithm.update({"states": batchStates,
                                                 "actions": batchActions,
