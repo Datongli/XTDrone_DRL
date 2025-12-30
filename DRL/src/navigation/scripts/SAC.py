@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 import numpy as np
 import copy
+import math
 
 
 class DepthCameraFeatureExtractor(nn.Module):
@@ -72,98 +73,195 @@ class DepthCameraFeatureExtractor(nn.Module):
         return x
         
 
+# class LidarFeatureExtractor2D(nn.Module):
+#     """
+#     2D激光雷达特征提取器
+#     """
+#     def __init__(self, cfg=None) -> None:
+#         """
+#         构造函数
+#         :param cfg: 配置
+#         :return: None
+#         """
+#         super().__init__()
+#         """可能需要的参数"""
+#         self.cfg = cfg
+#         """网络层"""
+#         # 卷积层
+#         self.conv1 = nn.LazyConv1d(out_channels=32, kernel_size=9, stride=2, padding=4)
+#         self.conv2 = nn.LazyConv1d(out_channels=64, kernel_size=7, stride=2, padding=3)
+#         self.conv3 = nn.LazyConv1d(out_channels=128, kernel_size=5, stride=2, padding=2)
+#         self.conv4 = nn.LazyConv1d(out_channels=128, kernel_size=3, stride=1, padding=1)
+#         # 激活层
+#         self.relu = nn.ReLU()
+#         # 归一化层
+#         self.bn1 = nn.Identity()
+#         self.bn2 = nn.Identity()
+#         self.bn3 = nn.Identity()
+#         self.bn4 = nn.Identity()
+#         # 池化层
+#         self.globalPool = nn.AdaptiveAvgPool1d(1)  # 全局平均池化
+#         # 线性层
+#         self.fc1 = nn.LazyLinear(out_features=256)
+#         self.fc2 = nn.LazyLinear(out_features=128)
+#         self.fc3 = nn.LazyLinear(out_features=64)
+#         self.fc4 = nn.LazyLinear(out_features=64)
+#         # dropout层
+#         # self.dropout = nn.Dropout(p=0.5)
+#         self.dropout = nn.Identity()
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         前向传播
+#         :param x: 输入张量
+#         :return: 输出张量
+#         """
+#         B, N, C, L = x.shape
+#         x = x.view(B * N, C, L)
+#         x = self.relu(self.bn1(self.conv1(x)))
+#         x = self.relu(self.bn2(self.conv2(x)))
+#         x = self.relu(self.bn3(self.conv3(x)))
+#         x = self.relu(self.bn4(self.conv4(x)))
+#         x = self.globalPool(x).squeeze(-1)
+#         x = self.dropout(self.relu(self.fc1(x)))
+#         x = self.dropout(self.relu(self.fc2(x)))
+#         x = self.dropout(self.relu(self.fc3(x)))
+#         x = self.fc4(x)
+#         x = x.view(B, N, -1)
+#         return x
+
+
 class LidarFeatureExtractor2D(nn.Module):
     """
-    2D激光雷达特征提取器
+    2D激光雷达特征提取器（512线 → 1D-CNN + Self-Attention）
     """
     def __init__(self, cfg=None) -> None:
-        """
-        构造函数
-        :param cfg: 配置
-        :return: None
-        """
         super().__init__()
-        """可能需要的参数"""
         self.cfg = cfg
-        """网络层"""
-        # 卷积层
-        self.conv1 = nn.LazyConv1d(out_channels=32, kernel_size=9, stride=2, padding=4)
-        self.conv2 = nn.LazyConv1d(out_channels=64, kernel_size=7, stride=2, padding=3)
-        self.conv3 = nn.LazyConv1d(out_channels=128, kernel_size=5, stride=2, padding=2)
-        self.conv4 = nn.LazyConv1d(out_channels=128, kernel_size=3, stride=1, padding=1)
-        # 激活层
+        # 1D-CNN：提取局部模式
+        self.conv1 = nn.Conv1d(1, 16, kernel_size=5, stride=2, padding=2)
+        self.conv2 = nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2)
+        self.conv3 = nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2)
+        self.bn1 = nn.BatchNorm1d(16) if getattr(cfg, "useBatchNorm", False) else nn.Identity()
+        self.bn2 = nn.BatchNorm1d(32) if getattr(cfg, "useBatchNorm", False) else nn.Identity()
+        self.bn3 = nn.BatchNorm1d(64) if getattr(cfg, "useBatchNorm", False) else nn.Identity()
         self.relu = nn.ReLU()
-        # 归一化层
-        self.bn1 = nn.Identity()
-        self.bn2 = nn.Identity()
-        self.bn3 = nn.Identity()
-        self.bn4 = nn.Identity()
-        # 池化层
-        self.globalPool = nn.AdaptiveAvgPool1d(1)  # 全局平均池化
-        # 线性层
-        self.fc1 = nn.LazyLinear(out_features=256)
-        self.fc2 = nn.LazyLinear(out_features=128)
-        self.fc3 = nn.LazyLinear(out_features=64)
-        self.fc4 = nn.LazyLinear(out_features=64)
-        # dropout层
-        # self.dropout = nn.Dropout(p=0.5)
+        self.pool = nn.MaxPool1d(2)
+        # Self-Attention：捕捉全局依赖（简化版 Transformer Encoder Layer）
+        self.attn = nn.MultiheadAttention(embed_dim=64, num_heads=4, batch_first=True)
+        self.attn_norm = nn.LayerNorm(64)
+        self.ffn = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64)
+        )
+        self.ffn_norm = nn.LayerNorm(64)
+        # 全局池化 + 输出 MLP
+        self.fc1 = nn.LazyLinear(128)
+        self.fc2 = nn.LazyLinear(64)
+        self.fc3 = nn.LazyLinear(4)
         self.dropout = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
-        :param x: 输入张量
-        :return: 输出张量
+        :param x: [B, N, 512]，B=batch, N=无人机数
+        :return: [B, N, 4]
         """
         B, N, C, L = x.shape
-        x = x.view(B * N, C, L)
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        x = self.relu(self.bn3(self.conv3(x)))
-        x = self.relu(self.bn4(self.conv4(x)))
-        x = self.globalPool(x).squeeze(-1)
+        x = x.view(B * N, 1, L)  # [B*N, 1, 512]
+        # 1D-CNN
+        x = self.pool(self.relu(self.bn1(self.conv1(x))))  # -> [B*N, 16, 128]
+        x = self.pool(self.relu(self.bn2(self.conv2(x))))  # -> [B*N, 32, 32]
+        x = self.pool(self.relu(self.bn3(self.conv3(x))))  # -> [B*N, 64, 8]
+        # Reshape for Attention: [B*N, SeqLen=8, Dim=64]
+        x = x.permute(0, 2, 1)  # [B*N, 8, 64]
+        # Self-Attention (residual)
+        attn_out, _ = self.attn(x, x, x)
+        x = self.attn_norm(x + attn_out)
+        # FFN (residual)
+        ffn_out = self.ffn(x)
+        x = self.ffn_norm(x + ffn_out)  # [B*N, 8, 64]
+        # 全局平均池化
+        x = x.mean(dim=1)  # [B*N, 64]
+        # MLP 输出
         x = self.dropout(self.relu(self.fc1(x)))
         x = self.dropout(self.relu(self.fc2(x)))
-        x = self.dropout(self.relu(self.fc3(x)))
-        x = self.fc4(x)
+        x = self.fc3(x)  # [B*N, 4]
         x = x.view(B, N, -1)
         return x
 
 
+# class TrackFeatureExtractor(nn.Module):
+#     """
+#     轨迹特征提取器
+#     """
+#     def __init__(self, cfg=None) -> None:
+#         """
+#         构造函数
+#         :param cfg: 配置
+#         :return: None
+#         """
+#         super().__init__()
+#         """可能需要的参数"""
+#         self.cfg = cfg
+#         """网络层"""
+#         # 全连接层
+#         self.fc1 = nn.LazyLinear(out_features=4)
+#         self.fc2 = nn.LazyLinear(out_features=64)
+#         self.fc3 = nn.LazyLinear(out_features=256)
+#         self.fc4 = nn.LazyLinear(out_features=64)
+#         self.fc5 = nn.LazyLinear(out_features=4)
+#         # 激活层
+#         self.relu = nn.ReLU()
+#         # dropout层
+#         # self.dropout = nn.Dropout(p=0.1)
+#         self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         前向传播
+#         :param x: 输入张量
+#         :return: 输出张量
+#         """
+#         B, N, S = x.shape
+#         x = x.view(B * N, S)
+#         x = self.dropout(self.relu(self.fc1(x)))
+#         x = self.dropout(self.relu(self.fc2(x)))
+#         x = self.dropout(self.relu(self.fc3(x)))
+#         x = self.dropout(self.relu(self.fc4(x)))
+#         x = self.fc5(x)
+#         x = x.view(B, N, -1)
+#         return x
+
+
 class TrackFeatureExtractor(nn.Module):
     """
-    轨迹特征提取器
+    轨迹特征提取器（状态：[dx, dy, dz, yaw]）
     """
     def __init__(self, cfg=None) -> None:
-        """
-        构造函数
-        :param cfg: 配置
-        :return: None
-        """
         super().__init__()
-        """可能需要的参数"""
         self.cfg = cfg
-        """网络层"""
-        # 全连接层
-        self.fc1 = nn.LazyLinear(out_features=4)
-        self.fc2 = nn.LazyLinear(out_features=64)
-        self.fc3 = nn.LazyLinear(out_features=256)
-        self.fc4 = nn.LazyLinear(out_features=64)
-        self.fc5 = nn.LazyLinear(out_features=4)
-        # 激活层
+        # 位置编码（可选，帮助网络理解周期性 yaw）
+        self.fc1 = nn.LazyLinear(32)
+        self.fc2 = nn.LazyLinear(64)
+        self.fc3 = nn.LazyLinear(128)
+        self.fc4 = nn.LazyLinear(64)
+        self.fc5 = nn.LazyLinear(4)
         self.relu = nn.ReLU()
-        # dropout层
-        # self.dropout = nn.Dropout(p=0.1)
-        self.dropout = nn.Identity()  # 有说法是dropout会在RL中引入不稳定噪声，因此暂时取消
+        self.dropout = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
-        :param x: 输入张量
-        :return: 输出张量
+        :param x: [B, N, 4]，[dx, dy, dz, yaw(已归一化到[-1,1])]
+        :return: [B, N, 4]
         """
         B, N, S = x.shape
         x = x.view(B * N, S)
+        # 对 yaw 做 sin/cos 编码（增强周期性理解）
+        yaw = x[:, 3:4]  # [B*N, 1]
+        yawSin = torch.sin(yaw * torch.pi)  # 已归一化到[-1,1]，乘π映射到[-π,π]
+        yawCos = torch.cos(yaw * torch.pi)
+        x = torch.cat([x[:, :3], yawSin, yawCos], dim=1)  # [B*N, 5]
         x = self.dropout(self.relu(self.fc1(x)))
         x = self.dropout(self.relu(self.fc2(x)))
         x = self.dropout(self.relu(self.fc3(x)))
@@ -588,7 +686,7 @@ class SAC:
             minRangeMeters = float(getattr(self.cfg.env, "minLidarMeters",
                                            getattr(self.cfg.env, "minDepthMeters", 0.5)))
             maxRangeMeters = float(getattr(self.cfg.env, "maxLidarMeters",
-                                           getattr(self.cfg.env, "maxDepthMeters", 20.0)))
+                                           getattr(self.cfg.env, "maxDepthMeters", 100.0)))
             # 替换无效值 -> 裁剪到量程 -> 线性缩放到[0,1]
             sensorNumpyArray = np.nan_to_num(sensorNumpyArray,
                                              nan=maxRangeMeters, posinf=maxRangeMeters, neginf=minRangeMeters)
