@@ -17,63 +17,12 @@ import torch
 from env.scripts.env import StaticObstacleEnv
 from navigation.scripts.SAC import SAC
 from navigation.scripts.DDPG import DDPG
+from navigation.scripts.MTransSAC import MTransSAC
 from uav.scripts.uav import UAVInfo
 from hydra.utils import to_absolute_path
 from train.scripts.tools import cfg_get, to_plain_cfg, load_checkPoint
 from train.scripts.tools import set_gazebo_unlimit, kill_gzclient
-
-
-def load_pth_models(checkpointDirctory: str, algorithm: DDPG | SAC, device):
-    """
-    加载 .pth 格式的单独模型文件（DDPG 专用）
-    :param checkpointDirctory: checkpoint 目录路径
-    :param algorithm: 算法实例（DDPG 或 SAC）
-    :param device: 设备
-    :return: 是否加载成功
-    """
-    try:
-        # 查找 .pth 文件
-        actorPath = os.path.join(checkpointDirctory, "actor.pth")
-        targetActorPath = os.path.join(checkpointDirctory, "target_actor.pth")
-        criticPath = os.path.join(checkpointDirctory, "critic.pth")
-        targetCriticPath = os.path.join(checkpointDirctory, "target_critic.pth")
-        pthLoad = {
-            "actor": actorPath,
-            "targetActor": targetActorPath,
-            "critic": criticPath,
-            "targetCritic": targetCriticPath
-        }
-        # 检查文件是否存在
-        requiredFiles = [actorPath, targetActorPath, criticPath, targetCriticPath]
-        missingFiles = [f for f in requiredFiles if not os.path.exists(f)]
-        if missingFiles:
-            print(f"[测试] 缺少模型文件: {missingFiles}")
-            return False
-        # 加载模型参数
-        print(f"[测试] 正在加载 DDPG 模型文件...")
-        for name, pth in pthLoad.items():
-            if os.path.exists(pth):
-                chechPoint = torch.load(pthLoad[name], map_location=device)
-                algorithm.netDict[name].load_state_dict(chechPoint["model"])
-                print(f"[测试] ✓ 已加载 {name}: {pth}")
-        # if hasattr(algorithm, 'actor'):
-        #     algorithm.actor.load_state_dict(torch.load(actorPath, map_location=device))
-        #     print(f"[测试] ✓ 已加载 actor: {actorPath}")
-        # if hasattr(algorithm, 'targetActor'):
-        #     algorithm.targetActor.load_state_dict(torch.load(targetActorPath, map_location=device))
-        #     print(f"[测试] ✓ 已加载 targetActor: {targetActorPath}")
-        # if hasattr(algorithm, 'critic'):
-        #     algorithm.critic.load_state_dict(torch.load(criticPath, map_location=device))
-        #     print(f"[测试] ✓ 已加载 critic: {criticPath}")
-        # if hasattr(algorithm, 'targetCritic'):
-        #     algorithm.targetCritic.load_state_dict(torch.load(targetCriticPath, map_location=device))
-        #     print(f"[测试] ✓ 已加载 targetCritic: {targetCriticPath}")
-        return True
-    except Exception as e:
-        print(f"[测试] 加载 .pth 模型失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+from tools import load_pt_models, load_pth_models, switch_model_eval_MTransSAC, switch_model_eval_DDPG
 
 
 # 复用 train 的 cfg 目录
@@ -87,13 +36,18 @@ def test(cfg) -> None:
     :param cfg: 配置文件
     :return: None
     """
+    # 注册表
+    ALGORITHM_REGISTRY = {
+        "DDPG": DDPG(cfg),
+        "SAC": SAC(cfg),
+        "MTrans-SAC": MTransSAC(cfg)
+    }
     """创建环境"""
     # 根据配置选择算法
     algorithmType = cfg_get(cfg, "eval.navigationModel", "SAC")
-    if algorithmType == "DDPG":
-        navigationAlgorithm = DDPG(cfg)
-    else:
-        navigationAlgorithm = SAC(cfg)
+    navigationAlgorithm = ALGORITHM_REGISTRY.get(algorithmType, None)
+    if navigationAlgorithm is None:
+        raise ValueError(f"[测试] 未知算法类型: {algorithmType}")
     print(f"[测试] 使用算法: {algorithmType}")
     env = StaticObstacleEnv(cfg)  # 导入环境
     if not bool(cfg_get(cfg, "gazebo.gui", False)):
@@ -118,6 +72,12 @@ def test(cfg) -> None:
         searchDir = preferPath if preferPath else checkPointDir
         print(f"[测试] 尝试从目录加载 .pth 文件: {searchDir}")
         loadSuccess = load_pth_models(searchDir, navigationAlgorithm, cfg_get(cfg, "device", "cpu"))
+    elif algorithmType == "MTrans-SAC":
+        # MTrans-SAC 目前仅支持 .pt 格式
+        ptName = "SAC_only_mean_good.pt"
+        loadCheckPointPath = os.path.join(preferPath if preferPath else checkPointDir, ptName)  # 要加载的检查点路径
+        # 加载模型参数
+        loadSuccess = load_pt_models(loadCheckPointPath, navigationAlgorithm)
     if not loadSuccess:
         latestCheckPointPath = os.path.join(checkPointDir, "latest.pt")
         loadFromPath = preferPath if (preferPath and os.path.exists(preferPath)) else latestCheckPointPath
@@ -147,22 +107,10 @@ def test(cfg) -> None:
         return
     """开启模型的评估模式"""
     try:
-        # actor模型
-        actorModule = getattr(navigationAlgorithm, "actor", None)
-        if actorModule is not None and hasattr(actorModule, "eval"):  actorModule.eval()
-        # targetActor模型
-        targetActorModule = getattr(navigationAlgorithm, "targetActor", None)
-        if targetActorModule is not None and hasattr(targetActorModule, "eval"):  targetActorModule.eval()
-        # critic模型
-        critic = getattr(navigationAlgorithm, "critic", None)
-        critic1 = getattr(navigationAlgorithm, "critic1", None)
-        critic2 = getattr(navigationAlgorithm, "critic2", None)
-        if critic is not None and hasattr(critic, "eval"):  critic.eval()
-        if critic1 is not None and hasattr(critic1, "eval"):  critic1.eval()
-        if critic2 is not None and hasattr(critic2, "eval"):  critic2.eval()
-        # targetCritic模型
-        targetCritic = getattr(navigationAlgorithm, "targetCritic", None)
-        if targetCritic is not None and hasattr(targetCritic, "eval"):  targetCritic.eval()
+        if algorithmType == "MTrans-SAC":
+            switch_model_eval_MTransSAC(navigationAlgorithm)
+        elif algorithmType == "DDPG":
+            switch_model_eval_DDPG(navigationAlgorithm)
         print("[测试] 模型已切换到评估模式")
     except Exception as e:
         print(f"[测试] 加载模型失败：{e}")
@@ -200,13 +148,49 @@ def test(cfg) -> None:
                 successCount = 0  # 成功降落的无人机个数
                 collisionCount = 0  # 碰撞的无人机个数
                 overCount = 0  # 超步长的无人机个数
+                landedCount = 0  # 着陆的无人机个数
                 while doneCount < cfg.uav.uavNums:
                     doneCount = 0
                     # 获得状态
                     states = [s for s in states if s is not None]
                     # 选择动作
-                    actions = navigationAlgorithm.take_action(states)
-                    actions = np.array(actions, dtype=np.float32)
+                    # actions = navigationAlgorithm.take_action(states)
+                    # actions = np.array(actions, dtype=np.float32)
+                    # 选择动作（跳过正在降落的无人机）
+                    activeStates = []
+                    activeIndices = []
+                    # 构造Batch
+                    batchUavStates = []
+                    batchSensorStates = []
+                    for i, uav in enumerate(env.uavs):
+                        # 跳过降落中和已完成的无人机
+                        if not uav.done and not uav.isLanding:
+                            if i < len(states):
+                                activeStates.append(states[i])
+                                activeIndices.append(i)
+                                uavData = states[uav.uavID]  # 获取当前无人机的状态
+                                batchUavStates.append(uavData["uavState"])
+                                batchSensorStates.append(uavData["sensorData"])
+                    # 堆叠数据
+                    batchInput = {
+                        "uavState": np.stack(batchUavStates),
+                        "sensorState": np.stack(batchSensorStates)
+                    }
+                    # 构建动作数组
+                    actions = np.zeros((cfg.uav.uavNums, 4), dtype=np.float32)
+                    if activeStates:
+                        if algorithmType == "MTrans-SAC":
+                            activeActions, _ = navigationAlgorithm.take_action(batchInput, deterministic=True)
+                            # 给每个动作末尾追加一个常数 np.pi/2
+                            activeActions = np.asarray(activeActions, dtype=np.float32)
+                            activeActions = np.concatenate(
+                                [activeActions, np.full((activeActions.shape[0], 1), np.pi / 2, dtype=np.float32)],
+                                axis=1
+                            )
+                        else:
+                            activeActions = navigationAlgorithm.take_action(activeStates)
+                        for idx, activeIdx in enumerate(activeIndices):
+                            actions[activeIdx] = activeActions[idx]
                     # 执行一步
                     nextStates, rewards, dones = env.step(actions)
                     # 累计回报
@@ -219,6 +203,8 @@ def test(cfg) -> None:
                         UAVInfo.COLLISION: 0,
                         UAVInfo.STEP_OVER: 0,
                         UAVInfo.NORMAL: 0,
+                        UAVInfo.LANDED: 0,
+                        UAVInfo.LANDING: 0
                     }
                     for uav in env.uavs:
                         statusCounters[uav.info] += 1
@@ -227,16 +213,18 @@ def test(cfg) -> None:
                     successCount = statusCounters[UAVInfo.SUCCESS]
                     collisionCount = statusCounters[UAVInfo.COLLISION]
                     overCount = statusCounters[UAVInfo.STEP_OVER]
+                    landedCount = statusCounters[UAVInfo.LANDED]  
+                    landingCount = statusCounters[UAVInfo.LANDING]  
                     states = nextStates  # 前进
                 # 回合结束，汇总统计
-                totalSuccess += successCount
+                totalSuccess += landedCount
                 totalCollision += collisionCount
                 totalOver += overCount
                 returns.append(episodeReturn)
                 progressBar.set_postfix({
                     "episode": f"{episode}",
                     "return": f"{episodeReturn:.3f}",
-                    "succ": f"{successCount}",
+                    "succ": f"{landedCount}",
                     "coll": f"{collisionCount}",
                     "over": f"{overCount}"
                 })
