@@ -12,9 +12,14 @@ launchFile: multi_uav_static_env.launch
 # 验证参数
 eval:
   numEpisodes: 1
-  checkPointPath: "/home/ldt/PythonProjects/self_avoid/Drone-self-avoidance/self_avoidance_gym/pth"
-  navigationModel: "DDPG"
+  # checkPointPath: "/home/ldt/PythonProjects/self_avoid/Drone-self-avoidance/self_avoidance_gym/pth"
+  checkPointPath: "/home/ldt/checkPoints"
+  # navigationModel: "DDPG"
+  navigationModel: "MTrans-SAC"
+  # navigationModel: "ego-planner"
 
+
+land: False  # 是否降落
 retrain: True  # 是否重新训练
 epochs: 1e5  # 训练轮数
 seed: 0  # 随机种子
@@ -55,3 +60,7 @@ wandb:
   checkPointDir: ../checkPoints  # 模型保存目录
   checkPointPath: ../checkPoints/kw9xf9k8.pt  # 模型保存路径
   saveEvery: 1  # 每训练n轮保存一次模型
+
+# 用于MTrans-SAC算法的测试配置
+actionBound: 2.0  # 动作限制
+loadModel: "SAC_only_mean_good.pt"

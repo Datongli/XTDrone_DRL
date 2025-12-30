@@ -1,16 +1,24 @@
 uav:
   # uav相关设置
-  uavNums: 2
+  uavNums: 1
   # 传感器类型设置
   # sensorType: "iris_realsense_camera"
   sensorType: "iris_2d_lidar"
+  # sensorType: "iris_2d_lidar_and_downward_camera"
   # 无人机初始化位置，目前只有y有用
   initPosition:
     x: 0
-    y: 2
+    y: 5
     z: 0.5
   # 无人机悬停位置
   hoverPosition:
     x: 0
     y: 0
     z: 5
+
+  # MTrans-SAC算法相关设置
+  stateDim: 7
+  sensor:
+    numBeams: 512  # 激光雷达波束数量
+    minRange: 0.5  # 激光雷达最小检测距离
+    maxRange: 100.0  # 激光雷达最大检测距离

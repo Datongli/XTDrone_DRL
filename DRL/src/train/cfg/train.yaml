@@ -10,10 +10,10 @@ device: "cuda:0"
 launchFile: multi_uav_static_env.launch
 
 # 训练参数
-navigationModel: SAC  # 模型种类
+land: False  # 是否降落
+navigationModel: "SAC"  # 模型种类
 # navigationModel: "DDPG"
 retrain: True  # 是否重新训练
-epochs: 1e5  # 训练轮数
 seed: 0  # 随机种子
 actorLearningRate: 1e-4  # 策略网络学习率
 criticLearningRate: 1e-4  # 动作价值网络学习率
