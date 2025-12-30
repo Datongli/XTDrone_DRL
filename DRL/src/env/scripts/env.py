@@ -23,6 +23,8 @@ from mavros_msgs.srv import ParamSet, CommandLong, ParamGet
 from mavros_msgs.msg import ParamValue
 import threading
 import time
+from xml.dom.minidom import parseString
+import signal
 
 
 class StaticObstacleEnv(gym.Env):
@@ -50,6 +52,12 @@ class StaticObstacleEnv(gym.Env):
         self.targetRadius: int| float = cfg.env.targetRadius  # 目标点半径
         self.stepCount: int = 0  # 步数
         port = "11311"  # ROS端口号
+        """注册信号处理"""
+        self.EnvProcesses: list[subprocess.Popen] = []  # 环境中所有进程集合
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        """检查是否有遗留进程"""
+        self._check_and_cleanup_existing_processes()
         """使用给定的启动文件名来启动模拟"""
         # 调整gazebo世界world文件的参数
         self._world_adaption()
@@ -88,6 +96,8 @@ class StaticObstacleEnv(gym.Env):
         self.uavSetState  = rospy.Publisher("gazebo/set_model_state", ModelState, queue_size=10)  # 无人机位置和姿态初始化设置
         # 无人机碰撞检测
         self.collisionDetectionSub = rospy.Subscriber("/benchmarker/collision", ContactsState, self._collisionDetectionCallback, queue_size=2)
+        """启动配套脚本"""
+        self._start_support_scripts()
 
     def reset(self) -> tuple:
         """
@@ -98,30 +108,25 @@ class StaticObstacleEnv(gym.Env):
         """
         super().reset()
         """gazebo物理仿真继续运行"""
+        if not self._safe_wait_for_service("/gazebo/unpause_physics"):
+            rospy.logwarn("Gazebo服务不可用，跳过重置")
+            return [None] * self.uavNums
+        self._safe_call_service(self.unpause)
         rospy.wait_for_service("/gazebo/unpause_physics")
-        try:
-            self.unpause()
-        except rospy.ServiceException as e:
-            rospy.logerr("取消暂停gazebo物理仿真失败: %s", e)
         # 等待所有无人机完成异步重置
         self._wait_for_all_uavs_reset_complete()
         """重置gazebo环境"""
         # 世界重置服务
-        rospy.wait_for_service("/gazebo/reset_world")
-        try:
-            self.resetProxy()
-        except rospy.ServiceException as e:
-            rospy.logerr("reset环境失败: %s", e)
+        if self._safe_wait_for_service("/gazebo/reset_world"):
+            self._safe_call_service(self.resetProxy)
         # 删除旧障碍物
-        rospy.wait_for_service("/gazebo/delete_model")
-        for i in range(self.staticObstaclesNum):
-            try:
-                self.deleteModel("cube_" + str(i))
-            except rospy.ServiceException as e:
-                if "does not exist" in str(e):
-                    pass  # 模型不存在时忽略
-                else:
-                    rospy.logerr("删除模型失败: %s", e)
+        if self._safe_wait_for_service("/gazebo/delete_model"):
+            for i in range(self.staticObstaclesNum):
+                try:
+                    self.deleteModel("cube_" + str(i))
+                except rospy.ServiceException as e:
+                    if "does not exist" in str(e):
+                        pass
         # 重置所有无人机状态为正常
         with self.resetLock:
             for i in range(self.uavNums):
@@ -138,11 +143,17 @@ class StaticObstacleEnv(gym.Env):
         """获取无人机和环境信息，暂停gazebo仿真"""
         # 无人机信息采集
         uavInformations = []
-        for uav in self.uavs:
+        for i,uav in enumerate(self.uavs):
             sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
             uavInformations.append({"sensorData": sensorData, 
                                     "uavState": uavState,
                                     "uavZ": uav.currentPosition.z})
+            # 初始化无人机到目标的距离
+            uav.lastDistanceToTarget = np.sqrt(
+                (self.targets[i].x - uav.currentPosition.x) ** 2 + 
+                (self.targets[i].y - uav.currentPosition.y) ** 2 + 
+                (self.targets[i].z - uav.currentPosition.z) ** 2
+            )
         rospy.loginfo("无人机信息采集完成")
         # 暂停gazebo物理仿真
         try:
@@ -163,27 +174,15 @@ class StaticObstacleEnv(gym.Env):
         rewards = [0 for _ in range(self.uavNums)]  # 奖励
         dones = [False for _ in range(self.uavNums)]  # 每个无人机是否结束
         """gazebo物理仿真继续运行"""
-        rospy.wait_for_service("/gazebo/unpause_physics")
-        try:
-            self.unpause()
-        except rospy.ServiceException as e:
-            rospy.logerr("取消暂停gazebo物理仿真失败: %s", e)
+        if self._safe_wait_for_service("/gazebo/unpause_physics", timeOut=2.0):
+            self._safe_call_service(self.unpause)
         """执行无人机动作"""
-        rate = rospy.Rate(50)  # 50Hz
-        for _ in range(100):
-            i = 0  # 计时一段时间
-            for uav in self.uavs:
-                # 跳过已完成或正在重置的无人机
-                if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
-                    continue
-                pose = self.make_pose(
-                    uav.currentPosition.x - uav.initPosition.x + actions[i][0],
-                    uav.currentPosition.y - uav.initPosition.y + actions[i][1],
-                    uav.currentPosition.z - uav.initPosition.z + actions[i][2],
-                    actions[i][3])
-                uav.shotTargetPub.publish(pose)
-                i += 1  # 无人机索引增加
-            rate.sleep()
+        if getattr(self.cfg, "navigationModel", "DDPG") == "SAC":
+            # 运用速度控制无人机动作
+            self._perform_action_by_velocity(actions)
+        else:
+            # 运用位置控制无人机动作
+            self._perform_action_by_position(actions)
         """判断无人机状态与计算奖励"""
         self.stepCount += 1  # 步数增加
         for i, uav in enumerate(self.uavs):
@@ -197,6 +196,30 @@ class StaticObstacleEnv(gym.Env):
                nextStates[i] = None
                rewards[i] = None
                continue
+            # 检查降落状态
+            if uav.isLanding:
+                rospy.loginfo(f"[LANDING] 检查 iris_{i} 降落状态")
+                # 检查是否降落完成
+                landingComplete, landingSuccess = self._check_landing_complete(uav)
+                if landingComplete:
+                    if landingSuccess:
+                        rospy.loginfo(f"iris_{uav.uavID}降落成功")
+                        rewards[i] += 500  # 降落成功额外奖励
+                        uav.info = UAVInfo.LANDED
+                    else:
+                        rospy.logwarn(f"iris_{uav.uavID}降落超时")
+                        rewards[i] -= 500
+                        uav.info = UAVInfo.STEP_OVER
+                    # 标记完成并启动异步重置
+                    uav.isLanding = False
+                    uav.changeDone()
+                    nextStates[i] = {"sensorData": uav.sensorData,
+                                    "uavState": [0, 0, 0, 0],
+                                    "uavZ": uav.currentPosition.z}
+                    dones[i] = True
+                    # 启动异步重置
+                    self._start_async_uav_reset(uav)
+                    continue  
             # 获取无人机信息
             sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
             if self.cfg.uav.sensorType == "iris_realsense_camera":
@@ -206,7 +229,9 @@ class StaticObstacleEnv(gym.Env):
             elif self.cfg.uav.sensorType == "iris_2d_lidar":
                 # 激光传感器中障碍物的距离惩罚
                 if sensorData is not None:
-                    rewards[i] += -1 / (np.min(sensorData) + 1e-3) * 2
+                    minSensorDistance = np.min(sensorData)  # 激光传感器中最近障碍物的距离
+                    if minSensorDistance < 2.0:
+                        rewards[i] += -10.0 * (2.0 - minSensorDistance) / 2.0
             # 碰撞惩罚
             if uav.currentPosition.z >= self.height: 
                 uav.changeDone()
@@ -218,35 +243,46 @@ class StaticObstacleEnv(gym.Env):
                 rewards[i] -= 1000
                 if uav.info == UAVInfo.NORMAL:
                     uav.info = UAVInfo.COLLISION  # 将无人机信息设置为碰撞
-            # 靠近目标奖励
-            rewards[i] += - np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
-                                    (self.targets[i].y - uav.currentPosition.y) ** 2 + 
-                                    (self.targets[i].z - uav.currentPosition.z) ** 2) * 5
+            # 靠近目标奖励：归一化距离保证+距离改善增量奖励
+            # 当前距离
+            currentDistance = np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
+                                      (self.targets[i].y - uav.currentPosition.y) ** 2 + 
+                                      (self.targets[i].z - uav.currentPosition.z) ** 2)
+            # 归一化距离
+            maxDistance = np.sqrt(self.length**2 + self.width**2 + self.height**2)
+            normalizedDistance = currentDistance / maxDistance
+            rewards[i] += - normalizedDistance * 10.0  # 靠近目标奖励
+            # 距离改善奖励
+            if hasattr(uav, 'lastDistanceToTarget') and uav.lastDistanceToTarget is not None:
+                distanceDelta = uav.lastDistanceToTarget - currentDistance
+                rewards[i] += distanceDelta * 5  # 靠近则加，远离则减
+            uav.lastDistanceToTarget = currentDistance  # 更新上一次距离目标的距离
             # 到达目标奖励
             if np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                        (self.targets[i].y - uav.currentPosition.y) ** 2 + 
-                       (self.targets[i].z - uav.currentPosition.z) ** 2) <= self.targetRadius:
+                       (self.targets[i].z - uav.currentPosition.z) ** 2) <= self.targetRadius * 4:
                 rewards[i] += 1000
-                uav.info = UAVInfo.SUCCESS  # 将无人机信息设置为成功
-                uav.changeDone()
+                uav.info = UAVInfo.LANDING
+                if getattr(self.cfg, "land", False):
+                    # 启动降落进程
+                    rospy.loginfo(f"iris_{uav.uavID}启动二维码降落进程")
+                    uav.isLanding = True
+                    uav.landingStartTime = rospy.get_rostime().to_sec()
+                    self._qr_landing(i)
+                else: pass
             nextStates[i] = {"sensorData": sensorData, 
                              "uavState": uavState,
                              "uavZ": uav.currentPosition.z}
             dones[i] = uav.done
             # 将第一次done的无人机，归位，锁定，本轮不再起飞
-            if uav.firstDone:
+            if uav.firstDone and not uav.isLanding:
+                rospy.logwarn(f"[FIRST_DONE] iris_{i} 触发异步重置")
                 # 启动异步重置
                 self._start_async_uav_reset(uav)
         """暂停gazebo物理仿真"""
-        rospy.wait_for_service("/gazebo/pause_physics")
-        try:
-            # 若任有进行中的无人机异步重置，跳过暂停
+        if self._safe_wait_for_service("/gazebo/pause_physics", timeOut=2.0):
             if self.activeResetCount == 0:
-                self.unpause()
-            else:
-                rospy.loginfo("仍有 %d 个无人机正在重置，跳过暂停gazebo物理仿真", self.activeResetCount)
-        except rospy.ServiceException as e:
-            rospy.logerr("暂停gazebo物理仿真失败: %s", e)
+                self._safe_call_service(self.pause)
         return nextStates, rewards, dones
 
     def render(self) -> None:
@@ -255,6 +291,56 @@ class StaticObstacleEnv(gym.Env):
         :return: None
         """
         pass
+
+    def _safe_wait_for_service(self, serviceName: str, timeOut: float=5.0) -> bool:
+        """
+        安全等待服务
+        :param serviceName: 服务名
+        :param timeout: 超时时间
+        :return: bool
+        """
+        try:
+            rospy.wait_for_service(serviceName, timeout=timeOut)
+            return True
+        except rospy.ROSException:
+            rospy.logerr(f"等待服务{serviceName}超时，超时时间为{timeOut}秒")
+            return False
+        except rospy.ROSInterruptException:
+            rospy.logwarn(f"等待服务{serviceName}被中断")
+            return False
+        
+    def _safe_call_service(self, serviceProxy, *args, **kwargs) -> bool:
+        """
+        安全调用服务
+        :param serviceProxy: 服务代理
+        :param args: 参数
+        :param kwargs: 关键字参数
+        :return: bool
+        """
+        try:
+            serviceProxy(*args, **kwargs)
+            return True
+        except rospy.ServiceException as e:
+            rospy.logerr(f"服务调用失败：{e}")
+            return False
+        except rospy.ROSInterruptException:
+            rospy.logwarn("服务调用被中断")
+            return False
+        
+    def _signal_handler(self, signum, frame):
+        """
+        处理中断信号
+        """
+        rospy.logwarn("收到中断信号,正在清理...")
+        self._clean_up_env_processes()
+        
+        # 清理所有无人机的重置线程
+        for thread in self.resetThreads:
+            if thread and thread.is_alive():
+                thread.join(timeout=2)
+        
+        rospy.signal_shutdown("用户中断")
+        sys.exit(0)
 
     def _collisionDetectionCallback(self, collisionData: ContactsState) -> None:
         """
@@ -268,6 +354,27 @@ class StaticObstacleEnv(gym.Env):
                 self.uavs[int(contact.collision1_name[5])].changeDone()
             if contact.collision2_name[:6] in uavID:
                 self.uavs[int(contact.collision2_name[5])].changeDone()
+
+    def _check_and_cleanup_existing_processes(self) -> None:
+        """
+        检查并清理已存在的进程
+        :return: None
+        """
+        try:
+            # 检查gazebo
+            result = subprocess.run(['pgrep', '-f', 'gzserver'], capture_output=True, text=True)
+            if result.stdout.strip():
+                rospy.logwarn("检测到遗留的Gazebo进程，正在清理...")
+                subprocess.run(['killall', '-9', 'gzserver', 'gzclient'], stderr=subprocess.DEVNULL)
+                time.sleep(1)
+            # 检查PX4
+            result = subprocess.run(['pgrep', '-f', 'px4'], capture_output=True, text=True)
+            if result.stdout.strip():
+                rospy.logwarn("检测到遗留的 PX4 进程,正在清理...")
+                subprocess.run(['killall', '-9', 'px4'], stderr=subprocess.DEVNULL)
+                time.sleep(1)
+        except Exception as e:
+            rospy.logwarn(f"清理遗留进程时发生错误：{e}")
 
     def _world_adaption(self) -> None:
         """
@@ -341,6 +448,7 @@ class StaticObstacleEnv(gym.Env):
                     <arg name="gcs_url" value=""/>
                     <arg name="tgt_system" value="$(eval 1 + arg('ID'))"/>
                     <arg name="tgt_component" value="1"/>
+                    <arg name="config_yaml" value="$(find mavros)/launch/px4_config_iris_{i}.yaml"/>
                 </include>
             </group>
             '''
@@ -420,8 +528,40 @@ class StaticObstacleEnv(gym.Env):
         # 额外等待，确保 MAVROS 完全初始化
         rospy.loginfo("等待 MAVROS 完全初始化...")
         rospy.sleep(5)
-        rospy.loginfo("所有 MAVROS 节点已就绪")
+        rospy.loginfo("所有 MAVROS 节点已就绪") 
+        
+    def _start_support_scripts(self)-> None:
+        """
+        启动配套脚本
+        :return: None
+        """
+        # 启动获取无人机gazebo中真实位置的脚本
+        self._start_get_gazebo_pose()
 
+    def _start_get_gazebo_pose(self) -> None:
+        """
+        启动获取无人机gazebo中真实位置的脚本
+        :return: None
+        """
+        rospy.loginfo("启动获取无人机gazebo中真实位置的脚本...")
+        # 脚本路径
+        scriptPath = os.path.expanduser("~/XTDrone/sensing/pose_ground_truth/get_local_pose.py")
+        # 若脚本不存在则返回
+        if not os.path.exists(scriptPath):
+            rospy.logerr(f"获取无人机gazebo中真实位置的脚本不存在：{scriptPath}")
+            return
+        # 启动脚本
+        try:
+            process = subprocess.Popen(
+                ['python', scriptPath, 'iris', str(self.uavNums)],
+                stdout=subprocess.PIPE,
+            )
+            # 记录进程
+            self.EnvProcesses.append(process)
+            rospy.loginfo(f"获取无人机gazebo中真实位置的脚本启动成功!")
+        except Exception as e:
+            rospy.logerr(f"从脚本启动获取无人机gazebo中真实位置的脚本失败: {e}")
+    
     def _wait_for_all_uavs_reset_complete(self) -> None:
         """
         等待所有无人机完成异步重置
@@ -584,6 +724,9 @@ class StaticObstacleEnv(gym.Env):
             uav.firstDone = False  # firstDone标志位置位
         # 等待无人机稳定
         rospy.sleep(2)
+        # 更新一下无人机信息
+        for uav in self.uavs:
+            uav.getInformation()
 
     @staticmethod
     def make_pose(x, y, z, yaw) -> Pose:
@@ -613,6 +756,19 @@ class StaticObstacleEnv(gym.Env):
         """
         # 先清空目标点
         self.targets.clear()
+        # 清空目标点的模型
+        rospy.wait_for_service("/gazebo/delete_model")
+        for i in range(self.uavNums):
+            try:
+                # 删除目标点模型
+                self.deleteModel(f"target_sphere_{i}")
+                # 删除二维码地标模型
+                self.deleteModel(f"apriltag_xtdrone_drl_{i}")
+            except rospy.ServiceException as e:
+                if "does not exist" in str(e):
+                    pass
+                else:
+                    rospy.logerr(f"删除目标点模型或二维码地标模型失败：{e}")
         # 每个无人机生成一个目标点
         for i in range(self.uavNums):
             while True:
@@ -620,15 +776,102 @@ class StaticObstacleEnv(gym.Env):
                 # 随机生成目标点
                 x = np.random.uniform(self.length * 0.2, self.length * 0.8)
                 y = np.random.uniform(self.width * 0.2, self.width * 0.8)
-                z = np.random.uniform(self.height * 0.5, self.height * 0.95)
+                z = np.random.uniform(self.height * 0.4, self.height * 0.6)
+                # x = self.uavs[i].currentPosition.x
+                # y = self.uavs[i].currentPosition.y
+                # z = self.uavs[i].currentPosition.z + 3
                 # 判断与其他目标点的距离是否过近
                 for otherTarget in self.targets:
-                    if math.sqrt((x - otherTarget.x) ** 2 + (y - otherTarget.y) ** 2 + (z - otherTarget.z) ** 2) < self.targetRadius * 4:
+                    if math.sqrt((x - otherTarget.x) ** 2 + (y - otherTarget.y) ** 2 + (z - otherTarget.z) ** 2) < self.targetRadius * 10:
                         flag = False
                         break
                 if flag:
                     break
             self.targets.append(Target(x, y, z))
+            # 在Gazebo中创建红色的目标点球体模型
+            self._spawn_target_sphere(i, x, y, z)
+            # 在Gazebo中创建二维码地标模型
+            self._spawn_apriltag_marker(i, x, y)
+
+    def _spawn_target_sphere(self, targetID: int, x: float, y: float, z: float) -> None:
+        """
+        在Gazebo中生成目标点球体
+        :param targetID: 目标点ID
+        :param x: x坐标
+        :param y: y坐标
+        :param z: z坐标
+        :return: None
+        """
+        # 等待服务可用
+        rospy.wait_for_service("/gazebo/spawn_sdf_model")
+        try:
+            # 读取sdf模版文件
+            templatePath = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/target_sphere.sdf")
+            with open(templatePath, 'r') as f:
+                sphereTemplate = f.read()
+            # 替换半径
+            sphereSDF = sphereTemplate.format(radius=self.targetRadius/2.0)
+            # 生成模型
+            pose = Pose(position=Point(x, y, z), orientation=Quaternion(0, 0, 0, 1))
+            self.spawnModel(
+                model_name=f"target_sphere_{targetID}",
+                model_xml=sphereSDF,
+                robot_namespace="/",
+                initial_pose=pose,
+                reference_frame="world"
+            )
+            rospy.loginfo(f"生成目标点球体 target_sphere_{targetID}，位置({x:.2f}, {y:.2f}, {z:.2f})")
+        except Exception as e:
+            rospy.logerr(f"生成目标点模型失败：{e}")
+
+    def _spawn_apriltag_marker(self, markerID: int, x: float, y: float) -> None:
+        """
+        在Gazebo中生成二维码地标模型
+        :param targetID: 目标点ID
+        :param x: x坐标
+        :param y: y坐标
+        :return: None
+        """
+        rospy.wait_for_service("/gazebo/spawn_sdf_model")
+        try:
+            # 二维码地标的路径
+            modelPath = os.path.expanduser("~/.gazebo/models/apriltag_xtdrone_drl")
+            # 检查模型是否存在
+            if not os.path.exists(modelPath):
+                rospy.logerr(f"二维码地标模型不存在：{modelPath}")
+                rospy.logwarn("请先运行 make_tag.py 和 make_gazebo_model.py 生成模型")
+                return
+            # 读取sdf文件
+            sdfPath = os.path.join(modelPath, "model.sdf")
+            with open(sdfPath, 'r') as f:
+                dom = parseString(f.read())
+                # 修改scale标签
+                scaleNodes = dom.getElementsByTagName('scale')
+                if scaleNodes:
+                    targetSize = getattr(self.cfg.env, 'apriltagSize', 0.5)
+                    originalSize = 0.5  # 原始模型尺寸
+                    scaleFactor = targetSize / originalSize
+                    scaleNodes[0].firstChild.nodeValue = f"{scaleFactor} {scaleFactor} {scaleFactor}"
+                apriltagSdf = dom.toxml()
+            # 设置模型的位置和角度
+            quaternion = tf.transformations.quaternion_from_euler(0, np.pi / 2, 0)
+            pose = Pose(
+                position=Point(x, y, 0.05),
+                orientation=Quaternion(x=quaternion[0], y=quaternion[1], z=quaternion[2], w=quaternion[3])  # 水平放置
+            )
+            # 生成模型
+            modelName = f"apriltag_xtdrone_drl_{markerID}"
+            self.spawnModel(
+                model_name=modelName,
+                model_xml=apriltagSdf,
+                robot_namespace="/",
+                initial_pose=pose,
+                reference_frame="world"
+            )
+            rospy.loginfo(f"生成AprilTag标记 {modelName}，位置({x:.2f}, {y:.2f}, 0.05)")
+        except Exception as e:
+            rospy.logerr(f"生成二维码地标模型失败：{e}")
+
 
     def _static_obstacles_generate(self) -> None:
         """
@@ -650,8 +893,8 @@ class StaticObstacleEnv(gym.Env):
                 halfWidth = np.random.uniform(self.obstacleHorizontalRange * 0.2, self.obstacleHorizontalRange)
                 height = np.random.uniform(self.obstacleVerticalRange * 0.4, self.obstacleVerticalRange)
                 # 随机生成障碍物位置
-                x = np.random.uniform(self.length * 0.1, self.length * 0.9)
-                y = np.random.uniform(self.width * 0.1, self.width * 0.9)
+                x = np.random.uniform(self.length * 0.2, self.length * 0.8)
+                y = np.random.uniform(self.width * 0.2, self.width * 0.8)
                 z = height / 2.0  # 确保障碍物底面在地面上
                 # 检查与其他障碍物的距离
                 for otherObstacle in self.staticObstacles:
@@ -680,6 +923,122 @@ class StaticObstacleEnv(gym.Env):
             except rospy.ServiceException as e:
                 rospy.logerr("生成障碍物失败: %s", e)
 
+    def _perform_action_by_velocity(self, actions: np.ndarray) -> None:
+        """
+        运用速度控制无人机动作
+        :return: None
+        """
+        frequency = 50  # 50Hz
+        rate = rospy.Rate(frequency)
+        dt = 1.0 / frequency
+        # 在循环外记录每个无人机的初始位置和yaw（作为积分基准）
+        initialStates = []
+        activeIndices = []  # 记录活跃无人机的索引
+        for uav in self.uavs:
+            if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
+                initialStates.append(None)
+                continue
+            uav.getInformation()  # 只在开始时获取一次
+            initialStates.append({
+                'x': uav.currentPosition.x,
+                'y': uav.currentPosition.y,
+                'z': uav.currentPosition.z,
+                'yaw': uav.currentYaw
+            })
+            activeIndices.append(uav.uavID)
+        # 执行2秒的速度控制（50步）
+        for step in range(frequency * 2):
+            actionIdx = 0  # actions数组的索引
+            for uavID, uav in enumerate(self.uavs):
+                if initialStates[uavID] is None:
+                    continue
+                # 累积时间
+                elapsed = (step + 1) * dt  # 从dt开始累积
+                # 基于初始位置+速度*累积时间 计算目标位置
+                initState = initialStates[uavID]
+                newX = initState['x'] + actions[actionIdx][0] * elapsed
+                newY = initState['y'] + actions[actionIdx][1] * elapsed
+                newZ = initState['z'] + actions[actionIdx][2] * elapsed
+                newYaw = initState['yaw'] + actions[actionIdx][3] * elapsed
+                # wrap yaw到[-pi, pi]
+                newYaw = ((newYaw + np.pi) % (2 * np.pi)) - np.pi
+                # 发布相对于初始位置的目标（PX4期望相对于home的位置）
+                pose = self.make_pose(
+                    newX - uav.initPosition.x,
+                    newY - uav.initPosition.y,
+                    newZ - uav.initPosition.z,
+                    newYaw
+                )
+                uav.shotTargetPub.publish(pose)
+                actionIdx += 1
+                rate.sleep()
+        
+    def _perform_action_by_position(self, actions: np.ndarray) -> None:
+        """
+        运用位置控制无人机动作
+        :return: None
+        """
+        rate = rospy.Rate(50)  # 50Hz
+        for _ in range(100):
+            i = 0  # 计时一段时间
+            for uav in self.uavs:
+                # 跳过已完成或正在重置的无人机
+                if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
+                    continue
+                pose = self.make_pose(
+                    uav.currentPosition.x - uav.initPosition.x + actions[i][0],
+                    uav.currentPosition.y - uav.initPosition.y + actions[i][1],
+                    uav.currentPosition.z - uav.initPosition.z + actions[i][2],
+                    actions[i][3])
+                uav.shotTargetPub.publish(pose)
+                i += 1  # 无人机索引增加
+            rate.sleep()
+
+    def _check_landing_complete(self, uav: UAV) -> tuple:
+        """
+        检查无人机是否降落完成
+        :param uav: 无人机对象
+        :return: (是否完成, 是否成功)
+        """
+        # 检查降落是否超时
+        if uav.landingStartTime is not None:
+            currentTime = rospy.get_rostime().to_sec()
+            elapsed = currentTime - uav.landingStartTime
+            if elapsed > uav.landingTimeout:
+                rospy.logwarn(f"[LANDING] iris_{uav.uavID} 降落超时（{elapsed:.1f}s）")
+                self._cleanup_landing_processes(uav)
+                return True, False  # 超时，降落失败
+        # 检查高度
+        uav.getInformation()
+        if uav.currentPosition.z < 0.3:
+            rospy.loginfo(f"[LANDING] iris_{uav.uavID} 降落完成")
+            self._cleanup_landing_processes(uav)
+            return True, True  # 降落完成
+        return False, False
+    
+    def _cleanup_landing_processes(self, uav: UAV) -> None:
+        """
+        清理无人机的降落进程
+        :param uav: 无人机对象
+        :return: None
+        """
+        if not hasattr(uav, 'landingProcesses'):
+            return
+        for process in uav.landingProcesses:
+            try:
+                if process and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                        rospy.loginfo(f"降落进程已正常终止: PID={process.pid}")
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        rospy.logwarn(f"降落进程被强制终止：PID={process.pid}")
+            except Exception as e:
+                rospy.logerr(f"清理进程失败: {e}")
+        uav.landingProcesses.clear()
+        rospy.loginfo(f"清理iris_{uav.uavID}降落进程已清理")
+
     def _uav_information_collection(self, uav: UAV) -> tuple:
         """
         无人机信息采集
@@ -690,11 +1049,150 @@ class StaticObstacleEnv(gym.Env):
         uav.getInformation()
         # 传感器数据，无人机状态
         sensorData = uav.sensorData
-        uavState = [self.targets[uav.uavID].x - uav.currentPosition.x, 
-                    self.targets[uav.uavID].y - uav.currentPosition.y, 
-                    self.targets[uav.uavID].z - uav.currentPosition.z,
-                    uav.currentYaw]
+        dx = self.targets[uav.uavID].x - uav.currentPosition.x
+        dy = self.targets[uav.uavID].y - uav.currentPosition.y
+        dz = self.targets[uav.uavID].z - uav.currentPosition.z
+        uavState = [dx, dy, dz]
+        if getattr(self.cfg.eval, "navigationModel", "MTrans-SAC") == "MTrans-SAC":
+            # 对雷达数据进行归一化处理
+            minRange = getattr(self.cfg.uav.sensor, "minRange", 0.5)
+            maxRange = getattr(self.cfg.uav.sensor, "maxRange", 100.0)
+            sensorData = (sensorData - minRange) / (maxRange - minRange)
+            # 构建无人机状态向量
+            # 无人机与目标点的三维坐标差值
+            uavState[0] = dx / self.length
+            uavState[1] = dy / self.width
+            uavState[2] = dz / self.height
+            # 无人机与目标的差值
+            distance = np.sqrt(dx**2 + dy**2 + dz**2)
+            distanceMax = np.sqrt(self.length**2 + self.width**2 + self.height**2)
+            uavState.append(distance / distanceMax)
+            # 无人机当前三维速度
+            actionBound = getattr(self.cfg, "actionBound", 2.0)
+            uavState.append(uav.velocity[0] / actionBound)
+            uavState.append(uav.velocity[1] / actionBound)
+            uavState.append(uav.velocity[2] / actionBound)
+            uavState = np.array(uavState)
+        else:
+            uavState.append(uav.currentYaw)
         return sensorData, uavState
+    
+    def _qr_landing(self, uavID: int) -> None:
+        """
+        进行二维码降落进程
+        :param uavID: 无人机ID
+        :return: None
+        """
+        uav = self.uavs[uavID]
+        # 清理无人机旧有的降落进程
+        for process in uav.landingProcesses[:]:
+            try:
+                if process and process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=2)
+            except Exception as e:
+                try:
+                    process.kill()
+                except:
+                    pass
+                rospy.logwarn(f"强制终止{uav.uavID}降落进程失败: {e}")
+        uav.landingProcesses.clear()
+        # 生成对应的apriltag_ros启动launch文件
+        self._generate_apriltag_ros_launch(uavID)
+        # 启动对应的launch文件
+        apriltagProcess = self._start_apriltag_ros_launch(uavID)
+        # 启动精准降落脚本
+        landingProcess = self._start_precision_landing(uavID)
+        # 正确存储进程
+        if apriltagProcess:
+            uav.landingProcesses.append(apriltagProcess)
+        if landingProcess:
+            uav.landingProcesses.append(landingProcess)
+        rospy.loginfo(f"iris_{uavID}降落进程已启动，共{len(uav.landingProcesses)}个")
+
+    def _generate_apriltag_ros_launch(self, uavID: int) -> None:
+        """
+        生成对应的apriltag_ros启动launch文件
+        :param uavID: 无人机ID
+        :return: None
+        """
+        try:
+            # launch文件夹路径
+            launchDir = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), 
+                "launch"
+            )
+            # 模板文件路径
+            templatePath = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), 
+                "launch/apriltag_ros.launch.template"
+            )
+            if not os.path.exists(templatePath):
+                rospy.logerr(f"apriltag_ros launch模板文件不存在: {templatePath}")
+                return
+            # 目标launch文件路径
+            launchPath = os.path.join(
+                launchDir, 
+                f"iris_{uavID}_apriltag_ros.launch"
+            )
+            # 读取模板文件
+            with open(templatePath, 'r') as f:
+                templateContent = f.read()
+            # 替换模板文件中的参数
+            templateContent = templateContent.format(uavID=uavID)
+            # 写入目标launch文件
+            with open(launchPath, 'w') as f:
+                f.write(templateContent)
+            rospy.loginfo(f"生成iris_{uavID} apriltag_ros launch文件成功")
+        except Exception as e:
+            rospy.logerr(f"生成iris_{uavID} apriltag_ros launch文件失败: {e}")
+
+    def _start_apriltag_ros_launch(self, uavID: int) -> None:
+        """
+        启动对应的apriltag_ros launch文件
+        :param uavID: 无人机ID
+        :return: None
+        """
+        try:
+            # launch文件路径
+            launchPath = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), 
+                f"launch/iris_{uavID}_apriltag_ros.launch"
+            )
+            if not os.path.exists(launchPath):
+                rospy.logerr(f"apriltag_ros launch文件不存在: {launchPath}")
+                return
+            # 使用subprocess启动laucnch文件
+            process = subprocess.Popen(
+                ['roslaunch', launchPath]
+            )
+            rospy.loginfo(f"启动iris_{uavID} apriltag_ros launch文件成功")
+            return process
+        except Exception as e:
+            rospy.logerr(f"启动iris_{uavID} apriltag_ros launch文件失败: {e}")
+            return None
+
+    def _start_precision_landing(self, uavID: int) -> None:
+        """
+        启动精准降落进程
+        :param uavID: 无人机ID
+        :return: None
+        """
+        rospy.loginfo(f"启动iris_{uavID} 精准降落进程")
+        # 精确降落脚本路径
+        precisionLandingPath = os.path.expanduser("~/XTDrone/control/precision_landing.py")
+        if not os.path.exists(precisionLandingPath):
+            rospy.logerr(f"精准降落脚本不存在: {precisionLandingPath}")
+            return
+        try:
+            process = subprocess.Popen(
+                ['python3', precisionLandingPath, 'iris', str(uavID)]
+            )
+            rospy.loginfo(f"启动iris_{uavID} 精准降落进程成功")
+            return process
+        except Exception as e:
+            rospy.logerr(f"启动iris_{uavID} 精准降落进程失败: {e}")
+            return None
 
     def _send_flight_termination(self, uav: UAV, enable: bool) -> None:
         """
@@ -747,12 +1245,22 @@ class StaticObstacleEnv(gym.Env):
         try:
             rospy.loginfo(f"异步重置无人机 iris_{uav.uavID} 开始")
             # 取消gazebo暂停
-            try:
-                self.unpause()
-            except rospy.ServiceException as e:
-                rospy.logerr("取消gazebo暂停失败: %s", e)
+            if not self._safe_wait_for_service("/gazebo/unpause_physics", timeOut=2.0):
+                rospy.logerr(f"Gazebo服务不可用，跳过重置iris_{uav.uavID}")
+                with self.resetLock:
+                    self.uavResetStates[uav.uavID] = UAVResetState.RESET_COMPLETE
+                    self.activeResetCount = max(0, self.activeResetCount - 1)
+                return 
+            self._safe_call_service(self.unpause)
+            # try:
+            #     self.unpause()
+            # except rospy.ServiceException as e:
+            #     rospy.logerr("取消gazebo暂停失败: %s", e)
+            # 先清理降落进程
+            self._cleanup_landing_processes(uav)
             # 重置firstDone标志
             uav.firstDone = False
+            uav.isLanding = False
             # 发送飞行终止命令
             self._send_flight_termination(uav, True)
             rospy.sleep(0.1)
@@ -775,8 +1283,9 @@ class StaticObstacleEnv(gym.Env):
             self._provide_initial_state(uav)
             # 设置无人机状态
             uav.done = True
+            uav.firstDone = False
+            uav.isLanding = False
             uav.getInformation()
-            # rospy.loginfo(f"无人机 iris_{uav.uavID} 的记录坐标为x={uav.currentPosition.x}, y={uav.currentPosition.y}, z={uav.currentPosition.z}")
             rospy.loginfo(f"无人机 iris_{uav.uavID} 已锁定在地面上")
             # 让无人机降落
             cmdMsg = String()
@@ -794,6 +1303,7 @@ class StaticObstacleEnv(gym.Env):
                 self.uavResetStates[uav.uavID] = UAVResetState.RESET_COMPLETE
         finally:
             with self.resetLock:
+                self.uavResetStates[uav.uavID] = UAVResetState.RESET_COMPLETE
                 self.activeResetCount = max(0, self.activeResetCount - 1)
 
     def _emergency_motor_kill(self, uav: UAV) -> None:
@@ -1001,6 +1511,31 @@ class StaticObstacleEnv(gym.Env):
             marker.pose.position.z = target.z
             markerArray.markers.append(marker)
         self.targetVisualization.publish(markerArray)
+
+    def __del__(self) -> None:
+        """
+        析构函数
+        """
+        # 清理相关进程
+        if hasattr(self, 'EnvProcesses'):
+            self._clean_up_env_processes()
+
+    def _clean_up_env_processes(self) -> None:
+        """
+        清理环境中所有进程
+        :return: None
+        """
+        rospy.loginfo("清理环境中所有进程...")
+        for process in getattr(self, "EnvProcesses", []):
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except Exception as e:
+                rospy.logerr(f"清理进程失败：{e}")
+        self.EnvProcesses = []
+        rospy.loginfo("环境进程清理完毕")
 
 
 if __name__ == "__main__":
