@@ -140,7 +140,7 @@ def test(cfg) -> None:
                     )
                     gazeboTurboApplied = True
                 # 环境重置
-                states = env.reset()
+                states = env.reset(seed=cfg_get(cfg, "seed", None))
                 time.sleep(2.0)
                 # 该回合统计值
                 episodeReturn = 0.0  # 该回合累计奖励
@@ -154,9 +154,6 @@ def test(cfg) -> None:
                     # 获得状态
                     states = [s for s in states if s is not None]
                     # 选择动作
-                    # actions = navigationAlgorithm.take_action(states)
-                    # actions = np.array(actions, dtype=np.float32)
-                    # 选择动作（跳过正在降落的无人机）
                     activeStates = []
                     activeIndices = []
                     # 构造Batch
@@ -217,7 +214,10 @@ def test(cfg) -> None:
                     landingCount = statusCounters[UAVInfo.LANDING]  
                     states = nextStates  # 前进
                 # 回合结束，汇总统计
-                totalSuccess += landedCount
+                if getattr(cfg, "land", False):
+                    totalSuccess += landedCount
+                else:
+                    totalSuccess += successCount
                 totalCollision += collisionCount
                 totalOver += overCount
                 returns.append(episodeReturn)
