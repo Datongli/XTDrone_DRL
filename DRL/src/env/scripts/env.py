@@ -15,7 +15,7 @@ from gazebo_msgs.srv import SpawnModel, DeleteModel
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose, Point, Quaternion, PoseStamped, TwistStamped
 from env.scripts.target import Target
-from env.scripts.obstacle import Obstacle
+from env.scripts.obstacle import Obstacle, Coordinate
 from visualization_msgs.msg import MarkerArray, Marker
 from gazebo_msgs.msg import ModelState, ContactsState
 from uav.scripts.uav import UAV, Position, UAVResetState, UAVInfo
@@ -25,6 +25,7 @@ import threading
 import time
 from xml.dom.minidom import parseString
 import signal
+from typing import Optional
 
 
 class StaticObstacleEnv(gym.Env):
@@ -37,19 +38,19 @@ class StaticObstacleEnv(gym.Env):
         :param cfg: 配置
         :return: None
         """
-        self.cfg = cfg
+        self.cfg = cfg  # 配置
         """初始化环境中参数"""
-        # 长宽高
-        self.length: int| float = cfg.env.length
-        self.width: int| float = cfg.env.width
-        self.height: int| float = cfg.env.height
-        self.staticObstaclesNum: int = cfg.env.staticObstaclesNum  # 静态障碍物数量
+        self.length: int| float = getattr(cfg.env, "length", 100)  # 环境长度
+        self.width: int| float = getattr(cfg.env, "width", 100)  # 环境宽度
+        self.height: int| float = getattr(cfg.env, "height", 25)  # 环境高度
+        self.level: int| float = getattr(cfg.env, "level", 1)  # 环境难度
+        self.staticObstaclesNum: int = 0  # 静态障碍物数量，初始为0，在reset中会重新生成
         self.staticObstacles: list[Obstacle] = []  # 静态障碍物集合
-        self.obstacleHorizontalRange: int| float = cfg.env.obstacleHorizontalRange  # 障碍物水平半径
-        self.obstacleVerticalRange: int| float = cfg.env.obstacleVerticalRange  # 障碍物垂直高度
-        self.uavNums: int = cfg.uav.uavNums  # 无人机数量
+        self.obstacleHorizontalRange: int| float = getattr(cfg.env, "obstacleHorizontalRange", 10)  # 障碍物水平半径
+        self.obstacleVerticalRange: int| float = getattr(cfg.env, "obstacleVerticalRange", 20)  # 障碍物垂直高度
+        self.uavNums: int = getattr(cfg.env, "uavNums", 1)  # 无人机数量
         self.targets: list[Target] = []  # 不同无人机的目标点集合
-        self.targetRadius: int| float = cfg.env.targetRadius  # 目标点半径
+        self.targetRadius: int| float = getattr(cfg.env, "targetRadius", 2.0)  # 目标点半径
         self.stepCount: int = 0  # 步数
         port = "11311"  # ROS端口号
         """注册信号处理"""
@@ -64,7 +65,7 @@ class StaticObstacleEnv(gym.Env):
         # ROS节点初始化
         rospy.init_node("static_obstacle_env", anonymous=True)
         # 按照要求修改launch文件
-        launchFile = cfg.launchFile
+        launchFile = getattr(cfg, "launchFile", "multi_uav_static_env.launch")
         if launchFile.startswith("/"):
             fullpath = launchFile
         else:
@@ -99,14 +100,18 @@ class StaticObstacleEnv(gym.Env):
         """启动配套脚本"""
         self._start_support_scripts()
 
-    def reset(self) -> tuple:
+    def reset(self, *, seed: Optional[int]=None, options: Optional[dict]=None) -> tuple:
         """
         重置环境
         重新随机生成障碍物，将无人机重置到初始位置并悬停，规划无人机目标点
         发布目标点和无人机状态，传感器数据
+        :param seed: 随机数种子，默认为None，自由随机初始化
+        :param options: 其他选项，默认为None
         :return: 无人机信息
         """
-        super().reset()
+        super().reset(seed=seed)
+        """清空静态障碍物"""
+        self.staticObstacles.clear()
         """gazebo物理仿真继续运行"""
         if not self._safe_wait_for_service("/gazebo/unpause_physics"):
             rospy.logwarn("Gazebo服务不可用，跳过重置")
@@ -135,10 +140,10 @@ class StaticObstacleEnv(gym.Env):
                 self.uavs[i].firstDone = False
         # 无人机归位，悬停
         self._uav_reset()
-        """生成无人机目标点"""
-        self._target_generate()
         """生成静态障碍物"""
         self._static_obstacles_generate()
+        """生成无人机目标点"""
+        self._target_generate()
         rospy.loginfo("环境重置完成，开始进行无人机信息采集...")
         """获取无人机和环境信息，暂停gazebo仿真"""
         # 无人机信息采集
@@ -185,6 +190,7 @@ class StaticObstacleEnv(gym.Env):
             self._perform_action_by_position(actions)
         """判断无人机状态与计算奖励"""
         self.stepCount += 1  # 步数增加
+        count = 0  # 计数器
         for i, uav in enumerate(self.uavs):
             # 跳过正在重置的无人机
             if self.uavResetStates[i] == UAVResetState.RESETTING:
@@ -204,11 +210,11 @@ class StaticObstacleEnv(gym.Env):
                 if landingComplete:
                     if landingSuccess:
                         rospy.loginfo(f"iris_{uav.uavID}降落成功")
-                        rewards[i] += 500  # 降落成功额外奖励
+                        rewards[i] += getattr(self.cfg.env.reward, "landReward", 100.0)
                         uav.info = UAVInfo.LANDED
                     else:
                         rospy.logwarn(f"iris_{uav.uavID}降落超时")
-                        rewards[i] -= 500
+                        rewards[i] -= getattr(self.cfg.env.reward, "landReward", 100.0)
                         uav.info = UAVInfo.STEP_OVER
                     # 标记完成并启动异步重置
                     uav.isLanding = False
@@ -220,27 +226,16 @@ class StaticObstacleEnv(gym.Env):
                     # 启动异步重置
                     self._start_async_uav_reset(uav)
                     continue  
-            # 获取无人机信息
-            sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
-            if self.cfg.uav.sensorType == "iris_realsense_camera":
-                # 深度相机中障碍物的距离惩罚
-                if sensorData is not None:
-                    rewards[i] += -1 / (np.min(sensorData) + 1e-3) * 2
-            elif self.cfg.uav.sensorType == "iris_2d_lidar":
-                # 激光传感器中障碍物的距离惩罚
-                if sensorData is not None:
-                    minSensorDistance = np.min(sensorData)  # 激光传感器中最近障碍物的距离
-                    if minSensorDistance < 2.0:
-                        rewards[i] += -10.0 * (2.0 - minSensorDistance) / 2.0
             # 碰撞惩罚
             if uav.currentPosition.z >= self.height: 
                 uav.changeDone()
+                rewards[i] -= getattr(self.cfg.env.reward, "collisionPenalty", 50.0)
             # 超过最大步长
             if self.stepCount == self.cfg.env.maxStep:
                 uav.changeDone()
+                rewards[i] -= getattr(self.cfg.env.reward, "stepOutPenalty", 5.0)
                 uav.info = UAVInfo.STEP_OVER  # 将无人机信息设置为超出最大步长
             if uav.firstDone:  # 此时firstDone为True的是发生了碰撞或者超出最大步长的
-                rewards[i] -= 1000
                 if uav.info == UAVInfo.NORMAL:
                     uav.info = UAVInfo.COLLISION  # 将无人机信息设置为碰撞
             # 靠近目标奖励：归一化距离保证+距离改善增量奖励
@@ -248,28 +243,93 @@ class StaticObstacleEnv(gym.Env):
             currentDistance = np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                                       (self.targets[i].y - uav.currentPosition.y) ** 2 + 
                                       (self.targets[i].z - uav.currentPosition.z) ** 2)
-            # 归一化距离
-            maxDistance = np.sqrt(self.length**2 + self.width**2 + self.height**2)
-            normalizedDistance = currentDistance / maxDistance
-            rewards[i] += - normalizedDistance * 10.0  # 靠近目标奖励
             # 距离改善奖励
+            targetReward = 0
             if hasattr(uav, 'lastDistanceToTarget') and uav.lastDistanceToTarget is not None:
                 distanceDelta = uav.lastDistanceToTarget - currentDistance
-                rewards[i] += distanceDelta * 5  # 靠近则加，远离则减
+                targetReward = distanceDelta * getattr(self.cfg.env.reward, "wTarget", 0.1)
             uav.lastDistanceToTarget = currentDistance  # 更新上一次距离目标的距离
+            # 角度引导奖励
+            vecToTarget = np.array([
+                self.targets[i].x - uav.currentPosition.x,
+                self.targets[i].y - uav.currentPosition.y,
+                self.targets[i].z - uav.currentPosition.z
+            ])
+            vecAction = np.array(actions[count][:3])  # 实际的动作
+            count += 1
+            normTarget = np.linalg.norm(vecToTarget) + 1e-6  # 计算向量的模
+            normAction = np.linalg.norm(vecAction) + 1e-6  # 获取动作的模
+            cosineSimilarity = np.dot(vecAction, vecToTarget) / (normTarget * normAction)  # 计算余弦相似度
+            wAngle = getattr(self.cfg.env.reward, "wAngle", 0.5)  # 角度引导权重
+            angleReward = wAngle * cosineSimilarity  # 计算角度奖励
+            # 边界逼近惩罚
+            boundaryPenalty = 0.0  # 初始化边界逼近惩罚
+            boundSafeDistance = getattr(self.cfg.env.reward, "safeDistance", 4.0)  # 边界安全距离
+            wBound = getattr(self.cfg.env.reward, "wBound", 0.1)  # 边界惩罚权重
+            minDistanceToWall = min(abs(uav.currentPosition.x), abs(uav.currentPosition.y), abs(uav.currentPosition.z), self.length - abs(uav.currentPosition.x),
+                                    self.width - abs(uav.currentPosition.y), self.height - abs(uav.currentPosition.z))  # 到边界的最小距离
+            if minDistanceToWall < boundSafeDistance:  # 如果到边界的距离小于安全距离
+                boundaryPenalty = -wBound * (boundSafeDistance - minDistanceToWall)
+            # 障碍物惩罚
+            obstaclePenalty = 0.0  # 初始化障碍物惩罚
+            sensorData, uavState = self._uav_information_collection(uav)  # 传感器数据和无人机状态
+            if self.cfg.uav.sensorType == "iris_realsense_camera":
+                # 深度相机中障碍物的距离惩罚
+                if sensorData is not None:
+                    rewards[i] += -1 / (np.min(sensorData) + 1e-3) * 2
+            elif self.cfg.uav.sensorType == "iris_2d_lidar" or self.cfg.uav.sensorType == "iris_2d_lidar_and_downward_camera":
+                # 激光传感器中障碍物的距离惩罚
+                if sensorData is not None and len(sensorData) > 0:
+                    sensorDataDenormalization = (np.array(sensorData) * (getattr(self.cfg.uav.sensor, "maxRange", 100.0) - getattr(self.cfg.uav.sensor, "minRange", 0.5))
+                                    + getattr(self.cfg.uav.sensor, "minRange", 0.5))  # 反归一化传感器数据
+                    safeDistance = getattr(self.cfg.env.reward, "safeDistance", 5.0)  # 安全距离
+                    dangerThreshold = getattr(self.cfg.env.reward, "dangerThreshold", 3.0)  # 危险阈值
+                    wMin = getattr(self.cfg.env.reward, "wMin", 0.5)  # 最小距离项权重
+                    wDanger = getattr(self.cfg.env.reward, "wDanger", 0.3)  # 危险束比例项权重
+                    wField = getattr(self.cfg.env.reward, "wField", 0.2)  # 距离势场项权重
+                    alpha = getattr(self.cfg.env.reward, "alpha", 2.0)  # 势场塑形的指数
+                    minDistance = float(np.min(sensorDataDenormalization))  # 最小距离
+                    dangerRatio = float(np.mean(sensorDataDenormalization < dangerThreshold))  # 危险束比例
+                    fieldTerm = float(np.mean((np.maximum(0.0, safeDistance - sensorDataDenormalization) / safeDistance) ** alpha))  # 距离势场项
+                    # 归一化minDistance惩罚
+                    minDistanceTerm = (safeDistance - min(minDistance, safeDistance)) / safeDistance
+                    minDistanceTerm = max(0.0, minDistanceTerm)
+                    # 计算障碍物惩罚
+                    obstaclePenalty = wMin * minDistanceTerm + wDanger * dangerRatio + wField * fieldTerm
+                    obstaclePenalty = -obstaclePenalty  # 转化为负数
+                    # 如果最小距离小于危险阈值，则取消角度引导奖励
+                    if minDistance < dangerThreshold:
+                        angleReward = 0.0
+            # 高度保护奖励
+            z = uav.currentPosition.z
+            heightMin, heightMax = 0.0, self.height  # 高度范围
+            safeMargin = getattr(self.cfg.env.reward, "safeMargin", 3.0)  # 保护距离
+            altitudePenalty = 0.0  # 初始化高度保护奖励
+            wAltitude = getattr(self.cfg.env.reward, "wAltitude", 0.5)  # 高度保护奖励系数
+            if z < safeMargin:
+                altitudePenalty = - wAltitude * ((safeMargin - z) / safeMargin) ** 2
+            elif z > (heightMax - safeMargin):
+                altitudePenalty = - wAltitude * ((z - (heightMax - safeMargin)) / safeMargin) ** 2
+            # 步数惩罚
+            stepPenalty = - getattr(self.cfg.env.reward, "wStep", 0.01)
+            # 汇总日常奖励
+            rewards[i] += targetReward + angleReward + boundaryPenalty + obstaclePenalty + altitudePenalty + stepPenalty
             # 到达目标奖励
             if np.sqrt((self.targets[i].x - uav.currentPosition.x) ** 2 + 
                        (self.targets[i].y - uav.currentPosition.y) ** 2 + 
-                       (self.targets[i].z - uav.currentPosition.z) ** 2) <= self.targetRadius * 4:
-                rewards[i] += 1000
-                uav.info = UAVInfo.LANDING
+                       (self.targets[i].z - uav.currentPosition.z) ** 2) <= 2:
+                rewards[i] += getattr(self.cfg.env.reward, "targetReward", 20.0)
                 if getattr(self.cfg, "land", False):
+                    uav.info = UAVInfo.LANDING
                     # 启动降落进程
                     rospy.loginfo(f"iris_{uav.uavID}启动二维码降落进程")
                     uav.isLanding = True
                     uav.landingStartTime = rospy.get_rostime().to_sec()
                     self._qr_landing(i)
-                else: pass
+                else: 
+                    uav.info = UAVInfo.SUCCESS
+                    uav.changeDone()
+                    dones[i] = True
             nextStates[i] = {"sensorData": sensorData, 
                              "uavState": uavState,
                              "uavZ": uav.currentPosition.z}
@@ -423,10 +483,21 @@ class StaticObstacleEnv(gym.Env):
             groupTQL = '''
             <!--iris_{i}-->
             <group ns="iris_{i}">
+                <node pkg="tf" type="static_transform_publisher" name="frd_broadcaster_{i}" args="0 0 0 0 0 0 iris_{i}/base_link iris_{i}/base_link_frd 100" />
                 <!--MAVROS配置-->
                     <arg name="ID" value="{i}"/>
                     <arg name="ID_in_group" value="{i}"/>
                     <arg name="fcu_url" default="udp://:{udpPort}@localhost:{gcsPort}"/>
+                    <param name="mavros/base_link_id" value="iris_{i}/base_link" />
+                    <param name="mavros/map_id" value="map" />
+                <rosparam>
+                    odometry:
+                        fcu:
+                            odom_parent_id: map
+                            odom_parent_id_des: map
+                            odom_child_id: iris_{i}/base_link
+                            odom_child_id_des: iris_{i}/base_link
+                </rosparam>
                 <!--PX4 SITL以及无人机产生-->
                 <include file="$(find px4)/launch/single_vehicle_spawn_xtd.launch">
                     <arg name="x" value="{x}"/>
@@ -460,8 +531,10 @@ class StaticObstacleEnv(gym.Env):
                         i=i,
                         udpPort=24540+i,
                         gcsPort=34580+i,
-                        x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
+                        # x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
+                        x=80,
                         y=self.cfg.uav.initPosition.y,
+                        # y=50,
                         z=0.5,
                         R=0.0,
                         P=0.0,
@@ -607,8 +680,10 @@ class StaticObstacleEnv(gym.Env):
             stateMsg = ModelState()
             stateMsg.model_name = "iris_" + str(uav.uavID)
             # 计算初始位置
-            initialX = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums)
+            # initialX = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums)
+            initialX = 80
             initialY = self.cfg.uav.initPosition.y
+            # initialY = 50
             initialZ = self.cfg.uav.initPosition.z
             stateMsg.pose.position.x = initialX
             stateMsg.pose.position.y = initialY
@@ -754,44 +829,59 @@ class StaticObstacleEnv(gym.Env):
         生成目标点
         :return: None
         """
-        # 先清空目标点
-        self.targets.clear()
         # 清空目标点的模型
         rospy.wait_for_service("/gazebo/delete_model")
-        for i in range(self.uavNums):
+        for i in range(len(self.targets)):
             try:
                 # 删除目标点模型
                 self.deleteModel(f"target_sphere_{i}")
-                # 删除二维码地标模型
-                self.deleteModel(f"apriltag_xtdrone_drl_{i}")
+                if getattr(self.cfg, "land", False):
+                    # 删除二维码地标模型
+                    self.deleteModel(f"apriltag_xtdrone_drl_{i}")
+                else: pass
             except rospy.ServiceException as e:
                 if "does not exist" in str(e):
                     pass
                 else:
                     rospy.logerr(f"删除目标点模型或二维码地标模型失败：{e}")
-        # 每个无人机生成一个目标点
-        for i in range(self.uavNums):
-            while True:
-                flag = True
-                # 随机生成目标点
-                x = np.random.uniform(self.length * 0.2, self.length * 0.8)
-                y = np.random.uniform(self.width * 0.2, self.width * 0.8)
-                z = np.random.uniform(self.height * 0.4, self.height * 0.6)
-                # x = self.uavs[i].currentPosition.x
-                # y = self.uavs[i].currentPosition.y
-                # z = self.uavs[i].currentPosition.z + 3
-                # 判断与其他目标点的距离是否过近
-                for otherTarget in self.targets:
-                    if math.sqrt((x - otherTarget.x) ** 2 + (y - otherTarget.y) ** 2 + (z - otherTarget.z) ** 2) < self.targetRadius * 10:
-                        flag = False
-                        break
-                if flag:
-                    break
-            self.targets.append(Target(x, y, z))
+        self.targets.clear()
+        """每个无人机生成一个目标点"""
+        count = 0
+        while len(self.targets) < self.uavNums:
+            # 构建目标点前期准备
+            x = float(self.np_random.uniform(self.length * 0.2, self.length * 0.8))  # 目标点的x坐标
+            y = float(self.np_random.uniform(self.width * 0.7, self.width * 0.9))  # 目标点的y坐标
+            z = float(self.np_random.uniform(self.height * 0.4, self.height * 0.6))  # 目标点的z坐标
+            # 创建目标点
+            generatorTarget = Target(x, y, z)
+            # 检查是否与障碍物距离过近
+            if count <= 50000:
+                if not self._is_target_overlop(generatorTarget):
+                    self.targets.append(generatorTarget)
+            else:
+                self.targets.append(generatorTarget)
+        """在Gazebo中创建目标点模型"""
+        for i in range(len(self.targets)):
+            target = self.targets[i]
             # 在Gazebo中创建红色的目标点球体模型
-            self._spawn_target_sphere(i, x, y, z)
+            self._spawn_target_sphere(i, target.x, target.y, target.z)
             # 在Gazebo中创建二维码地标模型
-            self._spawn_apriltag_marker(i, x, y)
+            if getattr(self.cfg, "land", False):
+                self._spawn_apriltag_marker(i, target.x, target.y)
+            else: pass
+
+    def _is_target_overlop(self, generatorTargent: Target) -> bool:
+        """
+        检查目标点是否与障碍物距离过近
+        :param generatorTargent: 目标点
+        :return: bool
+        """
+        for building in self.staticObstacles:
+            # 根据建筑物的中心坐标和半径判断是否重叠
+            if (abs(generatorTargent.x - building.x) < (self.targetRadius + building.halfLength) * 2 and
+                abs(generatorTargent.y - building.y) < (self.targetRadius + building.halfWidth) * 2):
+                return True
+        return False
 
     def _spawn_target_sphere(self, targetID: int, x: float, y: float, z: float) -> None:
         """
@@ -810,7 +900,7 @@ class StaticObstacleEnv(gym.Env):
             with open(templatePath, 'r') as f:
                 sphereTemplate = f.read()
             # 替换半径
-            sphereSDF = sphereTemplate.format(radius=self.targetRadius/2.0)
+            sphereSDF = sphereTemplate.format(radius=self.targetRadius/4.0)
             # 生成模型
             pose = Pose(position=Point(x, y, z), orientation=Quaternion(0, 0, 0, 1))
             self.spawnModel(
@@ -872,7 +962,6 @@ class StaticObstacleEnv(gym.Env):
         except Exception as e:
             rospy.logerr(f"生成二维码地标模型失败：{e}")
 
-
     def _static_obstacles_generate(self) -> None:
         """
         生成静态障碍物
@@ -882,46 +971,51 @@ class StaticObstacleEnv(gym.Env):
         # 读取sdf模板文件
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/cube_template.sdf"), 'r') as f:
             cubeTemplate = f.read()
-        minDistBetweenObstacles = self.length * 0.04  # 障碍物之间最小距离
-        minDistBetweenObstaclesAndTargets = self.targetRadius * 2  # 障碍物与目标点之间最小距离
-        for i in range(self.staticObstaclesNum):
-            for _ in range(100):  # 最多尝试100次
-                flag = True
-                """随机生成障碍物大小和位置"""
-                # 随机生成障碍物大小
-                halfLength = np.random.uniform(self.obstacleHorizontalRange * 0.2, self.obstacleHorizontalRange)
-                halfWidth = np.random.uniform(self.obstacleHorizontalRange * 0.2, self.obstacleHorizontalRange)
-                height = np.random.uniform(self.obstacleVerticalRange * 0.4, self.obstacleVerticalRange)
-                # 随机生成障碍物位置
-                x = np.random.uniform(self.length * 0.2, self.length * 0.8)
-                y = np.random.uniform(self.width * 0.2, self.width * 0.8)
-                z = height / 2.0  # 确保障碍物底面在地面上
-                # 检查与其他障碍物的距离
-                for otherObstacle in self.staticObstacles:
-                    if math.sqrt((x - otherObstacle.x) ** 2 + (y - otherObstacle.y) ** 2 + (z - otherObstacle.z) ** 2) < minDistBetweenObstacles:
-                        flag = False
-                        break
-                # 检查与目标点的距离
-                for target in self.targets:
-                    if math.sqrt((x - target.x) ** 2 + (y - target.y) ** 2 + (z - target.z) ** 2) < (minDistBetweenObstaclesAndTargets + np.sqrt(halfLength ** 2 + halfWidth ** 2)):
-                        flag = False
-                        break
-                if flag:
-                    break
-            self.staticObstacles.append(Obstacle(x, y, z, halfLength, halfWidth, height))
-            """用模版生成SDF"""
-            cubeSDF = cubeTemplate.format(size_x=halfLength * 2, size_y=halfWidth * 2, size_z=height)
-            pose = Pose(position=Point(x, y, z), orientation=Quaternion(0, 0, 0, 1))
-            try:
-                self.spawnModel(
-                    model_name = "cube_" + str(i),
-                    model_xml = cubeSDF,
-                    robot_namespace = "/",
-                    initial_pose = pose,
-                    reference_frame = "world"
-                )
-            except rospy.ServiceException as e:
-                rospy.logerr("生成障碍物失败: %s", e)
+        """确定障碍物数量"""
+        self.staticObstaclesNum = int(self.np_random.integers(self.level, self.level * 2 + 1))
+        """循环生成静态障碍物"""
+        count = 0  # 防止陷入无限循环
+        while len(self.staticObstacles) < self.staticObstaclesNum and count < 5000:
+            # 构建建筑物的前期准备
+            x = float(self.np_random.uniform(self.length * 0.1, self.length * 0.9))  # 建筑物中心x坐标
+            y = float(self.np_random.uniform(self.width * 0.1, self.width * 0.9))  # 建筑物中心y坐标
+            halfX = float(self.np_random.uniform(self.obstacleHorizontalRange * 0.1, self.obstacleHorizontalRange))  # 建筑物半长
+            halfY = float(self.np_random.uniform(self.obstacleHorizontalRange * 0.1, self.obstacleHorizontalRange))  # 建筑物半宽
+            height = float(self.np_random.uniform(self.obstacleVerticalRange * 0.1, self.obstacleVerticalRange))  # 建筑物高度
+            leftDown = Coordinate(x - halfX, y - halfY, 0)  # 建筑物左下角的坐标
+            rightUp = Coordinate(x + halfX, y + halfY, height)  # 建筑物右上角的坐标
+            # 创建障碍物
+            generateObstacle = Obstacle(x, y, halfX, halfY, height, leftDown, rightUp)
+            # 检查是否与其他障碍物重叠
+            if not self.staticObstacles or not self._is_building_overlap(generateObstacle):
+                self.staticObstacles.append(generateObstacle)
+                # 使用模版生成gazebo中障碍物模型
+                cubeSDF = cubeTemplate.format(size_x=halfX * 2, size_y=halfY * 2, size_z=height)
+                pose = Pose(position=Point(x, y, height / 2.0), orientation=Quaternion(0, 0, 0, 1))
+                try:
+                    self.spawnModel(
+                        model_name = "cube_" + str(len(self.staticObstacles) - 1),
+                        model_xml = cubeSDF,
+                        robot_namespace = "/",
+                        initial_pose = pose,
+                        reference_frame = "world"
+                    )
+                except rospy.ServiceException as e:
+                    rospy.logerr("生成障碍物失败: %s", e)
+            count += 1
+
+    def _is_building_overlap(self, generateObstacle: Obstacle) -> bool:
+        """
+        检查静态障碍物是否与已存在的静态障碍物重叠
+        :param generateObstacle: 静态障碍物
+        :return: bool
+        """
+        for building in self.staticObstacles:
+            # 根据建筑物的中心坐标和长度宽度判断是否重叠
+            if (abs(generateObstacle.x - building.x) < generateObstacle.halfLength + building.halfLength and
+                abs(generateObstacle.y - building.y) < generateObstacle.halfWidth + building.halfWidth):
+                return True
+        return False
 
     def _perform_action_by_velocity(self, actions: np.ndarray) -> None:
         """
@@ -1048,16 +1142,21 @@ class StaticObstacleEnv(gym.Env):
         # 采集无人机信息
         uav.getInformation()
         # 传感器数据，无人机状态
-        sensorData = uav.sensorData
+        if getattr(self.cfg.uav, "enableSimSensor", False):
+            # 启用仿真传感器，通过ros订阅传感器数据
+            sensorData = uav.sensorData
+            # 对雷达数据进行归一化处理
+            minRange = getattr(self.cfg.uav.sensor, "minRange", 0.5)
+            maxRange = getattr(self.cfg.uav.sensor, "maxRange", 100.0)
+            sensorData = (sensorData - minRange) / (maxRange - minRange)
+        else:
+            # 不启用仿真传感器，直接程序模拟
+            sensorData = uav.get_program_sensor_data(self, uav.currentYaw)
         dx = self.targets[uav.uavID].x - uav.currentPosition.x
         dy = self.targets[uav.uavID].y - uav.currentPosition.y
         dz = self.targets[uav.uavID].z - uav.currentPosition.z
         uavState = [dx, dy, dz]
         if getattr(self.cfg.eval, "navigationModel", "MTrans-SAC") == "MTrans-SAC":
-            # 对雷达数据进行归一化处理
-            minRange = getattr(self.cfg.uav.sensor, "minRange", 0.5)
-            maxRange = getattr(self.cfg.uav.sensor, "maxRange", 100.0)
-            sensorData = (sensorData - minRange) / (maxRange - minRange)
             # 构建无人机状态向量
             # 无人机与目标点的三维坐标差值
             uavState[0] = dx / self.length
