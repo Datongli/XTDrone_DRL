@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import numpy as np
 from enum import Enum
 import subprocess
+from uav.scripts.sensor import Lidar2D
+import gymnasium as gym
 
 
 @dataclass
@@ -99,6 +101,7 @@ class UAV:
         self.landingStartTime: int | float = None  # 降落开始时间
         self.landingTimeout: int | float = 60.0  # 降落超时时间，单位：秒
         self.landingProcesses: list[subprocess.Popen] = []  # 降落相关进程
+        self.programSensor: None| Lidar2D = None if getattr(cfg.uav, "enableSimSensor", False) else Lidar2D(cfg)
         """相关话题、服务"""
         # 短期目标发布
         self.shotTargetPub = rospy.Publisher("/xtdrone/"+"iris"+'_'+str(self.uavID)+"/cmd_pose_enu", Pose, queue_size=3)
@@ -132,6 +135,15 @@ class UAV:
             self.done = True
         else:
             pass
+
+    def get_program_sensor_data(self, env: gym.Env, yaw: int| float=np.pi/2.0) -> np.ndarray:
+        """
+        获取程序模拟传感器数据
+        :param env: 环境对象
+        :param yaw: 无人机偏航角，默认值为90度
+        :return: 2D激光雷达传感器在当前环境下的探测数据
+        """
+        return self.programSensor.get_sensor_data(self, env, yaw)
 
     def _setup_sensor_subscription(self) -> None:
         """
