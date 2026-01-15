@@ -275,6 +275,7 @@ class TrackFeatureExtractor(nn.Module):
 SENSOR_FEATURE_EXTRACTOR = {
         "iris_realsense_camera": DepthCameraFeatureExtractor(),
         "iris_2d_lidar": LidarFeatureExtractor2D(),
+        "iris_2d_lidar_and_downward_camera": LidarFeatureExtractor2D(),
     }
 
 class PolicyNet(nn.Module):
