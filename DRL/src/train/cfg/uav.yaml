@@ -5,6 +5,8 @@ uav:
   # sensorType: "iris_realsense_camera"
   sensorType: "iris_2d_lidar"
   # sensorType: "iris_2d_lidar_and_downward_camera"
+  # 是否启用Gazebo仿真传感器
+  enableSimSensor: False
   # 无人机初始化位置，目前只有y有用
   initPosition:
     x: 0

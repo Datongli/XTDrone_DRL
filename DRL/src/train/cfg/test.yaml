@@ -22,7 +22,7 @@ eval:
 land: False  # 是否降落
 retrain: True  # 是否重新训练
 epochs: 1e5  # 训练轮数
-seed: 0  # 随机种子
+seed: 131  # 随机种子
 actorLearningRate: 1e-4  # 策略网络学习率
 criticLearningRate: 1e-4  # 动作价值网络学习率
 alpha: 0.01  # alpha值
