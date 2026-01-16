@@ -32,13 +32,15 @@ class StaticObstacleEnv(gym.Env):
     """
     静态障碍物环境
     """
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, mode: str="train") -> None:
         """
         构造函数
         :param cfg: 配置
+        :param mode: 模式，"train"为训练模式，"test"为测试模式，默认"train"
         :return: None
         """
         self.cfg = cfg  # 配置
+        self.mode = mode  # 模式
         """初始化环境中参数"""
         self.length: int| float = getattr(cfg.env, "length", 100)  # 环境长度
         self.width: int| float = getattr(cfg.env, "width", 100)  # 环境宽度
@@ -93,7 +95,8 @@ class StaticObstacleEnv(gym.Env):
         self.resetProxy = rospy.ServiceProxy("/gazebo/reset_world", Empty)           # 重置世界服务
         self.deleteModel = rospy.ServiceProxy("/gazebo/delete_model", DeleteModel)   # 删除模型服务
         self.spawnModel = rospy.ServiceProxy("/gazebo/spawn_sdf_model", SpawnModel)  # 生成模型服务
-        self.targetVisualization = rospy.Publisher("/target", MarkerArray, queue_size=3)  # 目标点可视化
+        self.targetVisualization = rospy.Publisher("/target", MarkerArray, queue_size=3) if self.mode == "test" else None  # 目标点可视化
+        self.obstacleVisualization = rospy.Publisher("/static_obstacles", MarkerArray, queue_size=3, latch=True) if self.mode == "test" else None  # 静态障碍物在rviz中可视化
         self.uavSetState  = rospy.Publisher("gazebo/set_model_state", ModelState, queue_size=10)  # 无人机位置和姿态初始化设置
         # 无人机碰撞检测
         self.collisionDetectionSub = rospy.Subscriber("/benchmarker/collision", ContactsState, self._collisionDetectionCallback, queue_size=2)
@@ -112,6 +115,8 @@ class StaticObstacleEnv(gym.Env):
         super().reset(seed=seed)
         """清空静态障碍物"""
         self.staticObstacles.clear()
+        if self.mode == "test":
+            self._clear_static_obstacles_markers()
         """gazebo物理仿真继续运行"""
         if not self._safe_wait_for_service("/gazebo/unpause_physics"):
             rospy.logwarn("Gazebo服务不可用，跳过重置")
@@ -141,9 +146,11 @@ class StaticObstacleEnv(gym.Env):
         # 无人机归位，悬停
         self._uav_reset()
         """生成静态障碍物"""
-        self._static_obstacles_generate()
+        self._static_obstacles_generate()  # 生成并发布在Gazebo中
         """生成无人机目标点"""
         self._target_generate()
+        if self.mode == "test":
+            self._publish_maker()  # 生成并发布在rviz中
         rospy.loginfo("环境重置完成，开始进行无人机信息采集...")
         """获取无人机和环境信息，暂停gazebo仿真"""
         # 无人机信息采集
@@ -336,6 +343,12 @@ class StaticObstacleEnv(gym.Env):
             dones[i] = uav.done
             # 将第一次done的无人机，归位，锁定，本轮不再起飞
             if uav.firstDone and not uav.isLanding:
+                if self.mode == "test":
+                    if self._safe_wait_for_service("/gazebo/pause_physics", timeOut=2.0):
+                        self._safe_call_service(self.pause)
+                    rospy.sleep(180)
+                    if self._safe_wait_for_service("/gazebo/unpause_physics", timeOut=2.0):
+                        self._safe_call_service(self.unpause)
                 rospy.logwarn(f"[FIRST_DONE] iris_{i} 触发异步重置")
                 # 启动异步重置
                 self._start_async_uav_reset(uav)
@@ -480,6 +493,7 @@ class StaticObstacleEnv(gym.Env):
                 <!--控制Gazebo开启-->
                 <include file="$(find env)/launch/empty_world.launch"/>
             '''
+            # 每个无人机的launch文件内容
             groupTQL = '''
             <!--iris_{i}-->
             <group ns="iris_{i}">
@@ -523,6 +537,21 @@ class StaticObstacleEnv(gym.Env):
                 </include>
             </group>
             '''
+            # 测试模式下使用的轨迹可视化launch文件内容
+            trajectoryVisualizationLaunch = '''
+            <!--rviz-->
+            <include file="$(find env)/launch/trajectory_visualization.launch">
+                <arg name="uav_id" value="{i}"/>
+                <arg name="frame_id" value="{frame_id}"/>
+            </include>
+            '''
+            # 测试模式下启动rviz
+            rvizNode = '''
+            <!-- RViz：仅 test 模式启动 -->
+            <node pkg="rviz" type="rviz" name="rviz"
+                  args="-d $(find env)/rviz/trajectory_visualization.rviz"
+                  output="screen" required="false"/>
+            '''
             footer = '</launch>\n'
             with open(launchFile, 'w') as f:
                 f.write(header)
@@ -543,6 +572,15 @@ class StaticObstacleEnv(gym.Env):
                         mavlinkUdpPort=18570+i,
                         mavlinkTcpPort=4560+i,
                     ))
+                    # 如果是test模式，则添加轨迹可视化launch文件
+                    if self.mode == "test":
+                        f.write(trajectoryVisualizationLaunch.format(
+                            i=i,
+                            frame_id="map"
+                        ))
+                # 如果是test模式，则添加rviz节点
+                if self.mode == "test":
+                    f.write(rvizNode)
                 f.write(footer)
         except Exception as e:
             print(f"生成多无人机launch文件失败: {e}")
@@ -861,14 +899,16 @@ class StaticObstacleEnv(gym.Env):
             else:
                 self.targets.append(generatorTarget)
         """在Gazebo中创建目标点模型"""
-        for i in range(len(self.targets)):
-            target = self.targets[i]
-            # 在Gazebo中创建红色的目标点球体模型
-            self._spawn_target_sphere(i, target.x, target.y, target.z)
-            # 在Gazebo中创建二维码地标模型
-            if getattr(self.cfg, "land", False):
-                self._spawn_apriltag_marker(i, target.x, target.y)
-            else: pass
+        if self.mode == "test":
+            for i in range(len(self.targets)):
+                target = self.targets[i]
+                # 在Gazebo中创建红色的目标点球体模型
+                self._spawn_target_sphere(i, target.x, target.y, target.z)
+                # 在Gazebo中创建二维码地标模型
+                if getattr(self.cfg, "land", False):
+                    self._spawn_apriltag_marker(i, target.x, target.y)
+                else: pass
+        else: pass
 
     def _is_target_overlop(self, generatorTargent: Target) -> bool:
         """
@@ -1003,6 +1043,46 @@ class StaticObstacleEnv(gym.Env):
                 except rospy.ServiceException as e:
                     rospy.logerr("生成障碍物失败: %s", e)
             count += 1
+
+    def _clear_static_obstacles_markers(self) -> None:
+        """清空 RViz 中的静态障碍物 Marker（不影响 Gazebo 模型）。"""
+        try:
+            deleteAll = Marker()
+            deleteAll.action = Marker.DELETEALL
+            deleteAll.header.frame_id = "map"
+            deleteAll.header.stamp = rospy.Time.now()
+            self.obstacleVisualization.publish(MarkerArray(markers=[deleteAll]))
+        except Exception as e:
+            rospy.logwarn(f"清空Rviz静态障碍物Marker失败: {e}")
+
+    def _publish_static_obstacles_markers(self) -> None:
+        """发布静态障碍物的精确几何信息到 RViz（CUBE MarkerArray）。"""
+        markerArray = MarkerArray()
+        now = rospy.Time.now()
+        for idx, obs in enumerate(self.staticObstacles):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = now
+            marker.ns = "static_obstacles"
+            marker.id = idx
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(obs.x)
+            marker.pose.position.y = float(obs.y)
+            marker.pose.position.z = float(obs.height) / 2.0
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = float(obs.halfLength) * 2.0
+            marker.scale.y = float(obs.halfWidth) * 2.0
+            marker.scale.z = float(obs.height)
+            # 配图更清晰：半透明灰色方块
+            marker.color.r = 0.45
+            marker.color.g = 0.45
+            marker.color.b = 0.45
+            marker.color.a = 0.55
+            marker.lifetime = rospy.Duration(0.0)
+            markerArray.markers.append(marker)
+        if markerArray.markers:
+            self.obstacleVisualization.publish(markerArray)
 
     def _is_building_overlap(self, generateObstacle: Obstacle) -> bool:
         """
@@ -1586,14 +1666,41 @@ class StaticObstacleEnv(gym.Env):
         消息发布
         :return: None
         """
+        """发布静态障碍物的精确几何信息到 RViz（CUBE MarkerArray）。"""
+        markerArray = MarkerArray()
+        now = rospy.Time.now()
+        for idx, obs in enumerate(self.staticObstacles):
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = now
+            marker.ns = "static_obstacles"
+            marker.id = idx
+            marker.type = Marker.CUBE
+            marker.action = Marker.ADD
+            marker.pose.position.x = float(obs.x)
+            marker.pose.position.y = float(obs.y)
+            marker.pose.position.z = float(obs.height) / 2.0
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = float(obs.halfLength) * 2.0
+            marker.scale.y = float(obs.halfWidth) * 2.0
+            marker.scale.z = float(obs.height)
+            # 配图更清晰：半透明灰色方块
+            marker.color.r = 0.45
+            marker.color.g = 0.45
+            marker.color.b = 0.45
+            marker.color.a = 0.55
+            marker.lifetime = rospy.Duration(0.0)
+            markerArray.markers.append(marker)
+        if markerArray.markers:
+            self.obstacleVisualization.publish(markerArray)
         """发布目标点，用于rviz中可视化"""
         markerArray = MarkerArray()
-        for target in self.targets:
+        for idx, target in enumerate(self.targets):
             marker = Marker()
-            marker.header.frame_id = "world"  # 目标点坐标系
+            marker.header.frame_id = "map"  # 目标点坐标系
             marker.type = marker.SPHERE  # 渲染成球体
             marker.action = marker.ADD  # 增加
-            marker.id = target.uavID
+            marker.id = idx
             # 目标点大小
             marker.scale.x = self.targetRadius * 2
             marker.scale.y = self.targetRadius * 2
