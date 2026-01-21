@@ -55,6 +55,13 @@ class StaticObstacleEnv(gym.Env):
         self.targetRadius: int| float = getattr(cfg.env, "targetRadius", 2.0)  # 目标点半径
         self.stepCount: int = 0  # 步数
         port = "11311"  # ROS端口号
+        # 训练模式为了“离散步进/可复现/加速”，可以 pause；论文截图/观测时建议不断开物理
+        self.pausePhysicsBetweenSteps: bool = bool(getattr(cfg.env, "pausePhysicsBetweenSteps", mode != "test"))
+        # 控制发布频率（Hz）与每个 step 对应的控制时长（秒）
+        self.controlHz: int = int(getattr(cfg.env, "controlHz", 50))
+        self.stepDuration: float = float(getattr(cfg.env, "stepDuration", 1.0))
+        self.baseSeed: int| None = getattr(cfg, "seed", None)  # 基准随机种子
+        self.materialSeed: int| None = np.random.default_rng(self.baseSeed + 10007) if self.baseSeed is not None else np.random.default_rng(0)  # 材质随机种子
         """注册信号处理"""
         self.EnvProcesses: list[subprocess.Popen] = []  # 环境中所有进程集合
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -95,7 +102,7 @@ class StaticObstacleEnv(gym.Env):
         self.resetProxy = rospy.ServiceProxy("/gazebo/reset_world", Empty)           # 重置世界服务
         self.deleteModel = rospy.ServiceProxy("/gazebo/delete_model", DeleteModel)   # 删除模型服务
         self.spawnModel = rospy.ServiceProxy("/gazebo/spawn_sdf_model", SpawnModel)  # 生成模型服务
-        self.targetVisualization = rospy.Publisher("/target", MarkerArray, queue_size=3) if self.mode == "test" else None  # 目标点可视化
+        self.targetVisualization = rospy.Publisher("/target", MarkerArray, queue_size=3, latch=True) if self.mode == "test" else None  # 目标点可视化
         self.obstacleVisualization = rospy.Publisher("/static_obstacles", MarkerArray, queue_size=3, latch=True) if self.mode == "test" else None  # 静态障碍物在rviz中可视化
         self.uavSetState  = rospy.Publisher("gazebo/set_model_state", ModelState, queue_size=10)  # 无人机位置和姿态初始化设置
         # 无人机碰撞检测
@@ -112,6 +119,8 @@ class StaticObstacleEnv(gym.Env):
         :param options: 其他选项，默认为None
         :return: 无人机信息
         """
+        if seed is not None:
+            seed = self.baseSeed
         super().reset(seed=seed)
         """清空静态障碍物"""
         self.staticObstacles.clear()
@@ -168,10 +177,11 @@ class StaticObstacleEnv(gym.Env):
             )
         rospy.loginfo("无人机信息采集完成")
         # 暂停gazebo物理仿真
-        try:
-            self.pause()
-        except rospy.ServiceException as e:
-            rospy.logerr("暂停gazebo物理仿真失败: %s", e)
+        if self.pausePhysicsBetweenSteps:
+            try:
+                self.pause()
+            except rospy.ServiceException as e:
+                rospy.logerr("暂停gazebo物理仿真失败: %s", e)
         return uavInformations
         
     def step(self, actions: np.ndarray) -> tuple:
@@ -353,9 +363,10 @@ class StaticObstacleEnv(gym.Env):
                 # 启动异步重置
                 self._start_async_uav_reset(uav)
         """暂停gazebo物理仿真"""
-        if self._safe_wait_for_service("/gazebo/pause_physics", timeOut=2.0):
-            if self.activeResetCount == 0:
-                self._safe_call_service(self.pause)
+        if self.pausePhysicsBetweenSteps:
+            if self._safe_wait_for_service("/gazebo/pause_physics", timeOut=2.0):
+                if self.activeResetCount == 0:
+                    self._safe_call_service(self.pause)
         return nextStates, rewards, dones
 
     def render(self) -> None:
@@ -487,9 +498,10 @@ class StaticObstacleEnv(gym.Env):
             # launch文件头
             header = '''
             <launch>
+            <!-- 让 Gazebo 能找到 env/models 下的自定义模型与材质（model://xtdrone_drl_ground 等） -->
+            <env name="GAZEBO_MODEL_PATH" value="$(find env)/models:$(optenv GAZEBO_MODEL_PATH)"/>
             <!--控制Gazobo UI是否开启的参数-->
             <arg name="gui" value="true"/>
-
                 <!--控制Gazebo开启-->
                 <include file="$(find env)/launch/empty_world.launch"/>
             '''
@@ -560,10 +572,8 @@ class StaticObstacleEnv(gym.Env):
                         i=i,
                         udpPort=24540+i,
                         gcsPort=34580+i,
-                        # x=self.length // self.uavNums * i + self.length / (2 * self.uavNums),
-                        x=80,
+                        x=self.length // self.uavNums * i + self.length / (2 * self.uavNums) if self.mode == "train" else self.cfg.uav.initPosition.x,
                         y=self.cfg.uav.initPosition.y,
-                        # y=50,
                         z=0.5,
                         R=0.0,
                         P=0.0,
@@ -718,10 +728,8 @@ class StaticObstacleEnv(gym.Env):
             stateMsg = ModelState()
             stateMsg.model_name = "iris_" + str(uav.uavID)
             # 计算初始位置
-            # initialX = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums)
-            initialX = 80
+            initialX = self.length // self.uavNums * uav.uavID + self.length / (2 * self.uavNums) if self.mode == "train" else self.cfg.uav.initPosition.x
             initialY = self.cfg.uav.initPosition.y
-            # initialY = 50
             initialZ = self.cfg.uav.initPosition.z
             stateMsg.pose.position.x = initialX
             stateMsg.pose.position.y = initialY
@@ -1011,6 +1019,7 @@ class StaticObstacleEnv(gym.Env):
         # 读取sdf模板文件
         with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "models/cube_template.sdf"), 'r') as f:
             cubeTemplate = f.read()
+        self.buildingMaterialNames = getattr(self.cfg.env, "buildingMaterialNames", [])  # 建筑材料名称
         """确定障碍物数量"""
         self.staticObstaclesNum = int(self.np_random.integers(self.level, self.level * 2 + 1))
         """循环生成静态障碍物"""
@@ -1030,7 +1039,11 @@ class StaticObstacleEnv(gym.Env):
             if not self.staticObstacles or not self._is_building_overlap(generateObstacle):
                 self.staticObstacles.append(generateObstacle)
                 # 使用模版生成gazebo中障碍物模型
-                cubeSDF = cubeTemplate.format(size_x=halfX * 2, size_y=halfY * 2, size_z=height)
+                materialName = self.buildingMaterialNames[int(self.materialSeed.integers(0, len(self.buildingMaterialNames)))]
+                cubeSDF = cubeTemplate.format(size_x=halfX * 2, 
+                                              size_y=halfY * 2, 
+                                              size_z=height,
+                                              materialName=materialName)
                 pose = Pose(position=Point(x, y, height / 2.0), orientation=Quaternion(0, 0, 0, 1))
                 try:
                     self.spawnModel(
@@ -1149,23 +1162,68 @@ class StaticObstacleEnv(gym.Env):
         
     def _perform_action_by_position(self, actions: np.ndarray) -> None:
         """
-        运用位置控制无人机动作
-        :return: None
+        位置控制（平滑版本）：
+        - 一个 step 对应 stepDuration 秒
+        - 在这段时间内以 controlHz 连续发布插值后的 setpoint
+        - 作用：无人机保持连续飞行，不会“到点悬停等下一步”，RViz 轨迹更平滑
         """
-        rate = rospy.Rate(50)  # 50Hz
-        for _ in range(100):
-            i = 0  # 计时一段时间
-            for uav in self.uavs:
-                # 跳过已完成或正在重置的无人机
-                if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
-                    continue
-                pose = self.make_pose(
-                    uav.currentPosition.x - uav.initPosition.x + actions[i][0],
-                    uav.currentPosition.y - uav.initPosition.y + actions[i][1],
-                    uav.currentPosition.z - uav.initPosition.z + actions[i][2],
-                    actions[i][3])
+        hz = max(1, int(self.controlHz))
+        duration = max(0.02, float(self.stepDuration))
+        steps = max(1, int(hz * duration))
+        rate = rospy.Rate(hz)
+        # 1) 找出本步需要控制的无人机（跳过 done/重置中的）
+        activeUavs = []
+        for uav in self.uavs:
+            if uav.firstDone or uav.done or self.uavResetStates[uav.uavID] != UAVResetState.NORMAL:
+                continue
+            uav.getInformation()  # 读取一次作为插值起点
+            activeUavs.append(uav)
+        if not activeUavs:
+            return
+        # 2) 将 actions 映射到 activeUavs（actions 的行数应等于 active 数量）
+        actionCount = min(len(actions), len(activeUavs))
+        # 3) 记录每个无人机的起点与终点（相对 initPosition 的 setpoint）
+        startSetpoints = []
+        endSetpoints = []
+        startYaws = []
+        endYaws = []
+        for idx in range(actionCount):
+            uav = activeUavs[idx]
+            # 起点：当前相对 initPosition 的坐标（与你原逻辑一致）
+            sx = float(uav.currentPosition.x - uav.initPosition.x)
+            sy = float(uav.currentPosition.y - uav.initPosition.y)
+            sz = float(uav.currentPosition.z - uav.initPosition.z)
+            dx = float(actions[idx][0])
+            dy = float(actions[idx][1])
+            dz = float(actions[idx][2])
+            dyaw = float(actions[idx][3])
+            ex = sx + dx
+            ey = sy + dy
+            ez = sz + dz
+            # yaw 这里按“增量”处理：在 duration 内平滑转过去
+            syaw = float(getattr(uav, "currentYaw", 0.0))
+            eyaw = syaw + dyaw
+            # wrap 到 [-pi, pi]
+            eyaw = ((eyaw + np.pi) % (2 * np.pi)) - np.pi
+            startSetpoints.append((sx, sy, sz))
+            endSetpoints.append((ex, ey, ez))
+            startYaws.append(syaw)
+            endYaws.append(eyaw)
+        # 4) 插值发布：每个 tick 推进一点点
+        for k in range(steps):
+            alpha = float(k + 1) / float(steps)  # (0,1]
+            for idx in range(actionCount):
+                uav = activeUavs[idx]
+                sx, sy, sz = startSetpoints[idx]
+                ex, ey, ez = endSetpoints[idx]
+                tx = sx + (ex - sx) * alpha
+                ty = sy + (ey - sy) * alpha
+                tz = sz + (ez - sz) * alpha
+                syaw = startYaws[idx]
+                eyaw = endYaws[idx]
+                tyaw = np.pi / 2.0
+                pose = self.make_pose(tx, ty, tz, tyaw)
                 uav.shotTargetPub.publish(pose)
-                i += 1  # 无人机索引增加
             rate.sleep()
 
     def _check_landing_complete(self, uav: UAV) -> tuple:
@@ -1694,27 +1752,35 @@ class StaticObstacleEnv(gym.Env):
         if markerArray.markers:
             self.obstacleVisualization.publish(markerArray)
         """发布目标点，用于rviz中可视化"""
+        # 先清空旧的目标点marker，避免残留导致颜色/数量不一致
+        deleteAll = Marker()
+        deleteAll.action = Marker.DELETEALL
+        deleteAll.header.frame_id = "map"
+        deleteAll.header.stamp = now
+        markerArray.markers.append(deleteAll)
         markerArray = MarkerArray()
         for idx, target in enumerate(self.targets):
             marker = Marker()
-            marker.header.frame_id = "map"  # 目标点坐标系
-            marker.type = marker.SPHERE  # 渲染成球体
-            marker.action = marker.ADD  # 增加
+            marker.header.frame_id = "map"
+            marker.header.stamp = now
+            marker.ns = "targets"
             marker.id = idx
-            # 目标点大小
-            marker.scale.x = self.targetRadius * 2
-            marker.scale.y = self.targetRadius * 2
-            marker.scale.z = self.targetRadius * 2
-            # 渲染的颜色和不透明度
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            # 大小
+            marker.scale.x = float(self.targetRadius) * 1.2
+            marker.scale.y = float(self.targetRadius) * 1.2
+            marker.scale.z = float(self.targetRadius) * 1.2
+            # 颜色
             marker.color.a = 1.0
-            marker.color.r = 0.0
-            marker.color.g = 1.0
+            marker.color.r = 1.0
+            marker.color.g = 0.0
             marker.color.b = 0.0
-            marker.pose.orientation.w = 1.0  # 无旋转
-            # 目标点位置
-            marker.pose.position.x = target.x
-            marker.pose.position.y = target.y
-            marker.pose.position.z = target.z
+            marker.pose.orientation.w = 1.0
+            marker.pose.position.x = float(target.x)
+            marker.pose.position.y = float(target.y)
+            marker.pose.position.z = float(target.z)
+            marker.lifetime = rospy.Duration(0.0)
             markerArray.markers.append(marker)
         self.targetVisualization.publish(markerArray)
 
