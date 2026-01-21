@@ -50,6 +50,7 @@
 
       <sensor name="laser" type="ray">
         <pose>0 0 0.0175 0 -0 0</pose>
+        <visualize>True</visualize>  <!--控制是否可视化-->
         <ray>
           <scan>
             <horizontal>
@@ -60,7 +61,7 @@
             </horizontal>
           </scan>
           <range>
-            <min>0.1</min>
+            <min>0.5</min>
             <max>100</max>
             <resolution>0.01</resolution>
           </range>
