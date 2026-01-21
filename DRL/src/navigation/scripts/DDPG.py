@@ -357,6 +357,10 @@ class DDPG:
             sensorFeatures = distances.copy()
             sensorFeatures.insert(4, float(uavZ))  # 下（当前高度）
             sensorFeatures.insert(5, float(self.cfg.env.height - uavZ))  # 上（到天花板距离）
+            # 反归一化传感器数据
+            minRange = getattr(self.cfg.uav.sensor, "minRange", 0.5)
+            maxRange = getattr(self.cfg.uav.sensor, "maxRange", 100.0)
+            sensorFeatures = [minRange + (maxRange - minRange) * x for x in sensorFeatures]
             # 提取 UAV 状态（前3个元素：通常是 x, y, z 或 x, y, yaw）
             if isinstance(uavStateRaw, (list, tuple)):
                 uav_state = [float(x) for x in uavStateRaw[:3]]
@@ -365,6 +369,10 @@ class DDPG:
             else:
                 # 如果是单个数值
                 uav_state = [float(uavStateRaw), 0.0, 0.0]
+            # 反归一化UAV状态
+            uav_state[0] = uav_state[0] * getattr(self.cfg.env, "length", 100.0)
+            uav_state[1] = uav_state[1] * getattr(self.cfg.env, "width", 100.0)
+            uav_state[2] = uav_state[2] * getattr(self.cfg.env, "height", 25.0)
             # 拼接状态：UAV状态(3) + 传感器特征(10) = 13维
             combined_state = uav_state + sensorFeatures
             stateList.append(combined_state)
