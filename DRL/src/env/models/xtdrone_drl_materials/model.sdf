@@ -1,0 +1,7 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="xtdrone_drl_materials">
+    <static>true</static>
+    <link name="dummy_link"/>
+  </model>
+</sdf>
