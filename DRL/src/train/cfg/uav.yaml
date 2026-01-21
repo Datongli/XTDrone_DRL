@@ -7,9 +7,10 @@ uav:
   # sensorType: "iris_2d_lidar_and_downward_camera"
   # 是否启用Gazebo仿真传感器
   enableSimSensor: False
-  # 无人机初始化位置，目前只有y有用
+  # 无人机初始化位置，训练时x，y会随机生成
+  # 测试时一般只测试一个位置，程序按照下列的输入初始化无人机位置
   initPosition:
-    x: 0
+    x: 80
     y: 5
     z: 0.5
   # 无人机悬停位置

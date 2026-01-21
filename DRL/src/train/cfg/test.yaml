@@ -44,7 +44,7 @@ normalizeDepth: True  # 是否归一化深度信息
 gazebo:
   gui: True  # 是否启用gui
   turbo:
-    enabled: True  # 加速开关
+    enabled: False  # 加速开关
     timeStep: None  # 时间步长，None则保持原状
 
 # wandb参数
