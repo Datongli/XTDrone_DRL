@@ -1,0 +1,33 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <model name="xtdrone_drl_ground">
+    <static>true</static>
+    <link name="ground_link">
+      <collision name="collision">
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>200 200</size>
+          </plane>
+        </geometry>
+      </collision>
+
+      <visual name="visual">
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>200 200</size>
+          </plane>
+        </geometry>
+
+        <material>
+          <script>
+            <uri>model://xtdrone_drl_ground/materials/scripts</uri>
+            <uri>model://xtdrone_drl_ground/materials/textures</uri>
+            <name>XtDroneDrl/Ground</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>
