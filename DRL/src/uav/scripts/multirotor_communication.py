@@ -4,8 +4,11 @@ from mavros_msgs.srv import CommandBool, SetMode, ParamSet
 from geometry_msgs.msg import PoseStamped, Pose, Twist
 from std_msgs.msg import String
 from pyquaternion import Quaternion
-
 import sys
+try:
+    from quadrotor_msgs.msg import PositionCommand
+except Exception:
+    PositionCommand = None
 
 
 
@@ -27,6 +30,8 @@ class Communication:
         self.mission = None  # 任务
         self.last_cmd = None
         self.rate = rospy.Rate(30)
+        self._pos_cmd_last_stamp = rospy.Time(0)  # ego-planner
+        self.pos_cmd_timeout = rospy.Duration.from_sec(0.5)
         # 等待MAVROS连接状态
         mavros_state = rospy.wait_for_message(self.vehicle_type+'_'+self.vehicle_id+"/mavros/state", State)
         if not mavros_state.connected:
@@ -50,6 +55,15 @@ class Communication:
         # 监听无人机加速度指令(flu和enu坐标系下)
         self.cmd_accel_flu_sub = rospy.Subscriber("/xtdrone/"+self.vehicle_type+'_'+self.vehicle_id+"/cmd_accel_flu", Twist, self.cmd_accel_flu_callback,queue_size=1)
         self.cmd_accel_enu_sub = rospy.Subscriber("/xtdrone/"+self.vehicle_type+'_'+self.vehicle_id+"/cmd_accel_enu", Twist, self.cmd_accel_enu_callback,queue_size=1)
+        # 订阅 ego-planner pos_cmd（如果消息类型可用）
+        self.pos_cmd_sub = None
+        if PositionCommand is not None:
+            pos_cmd_topic = f"/xtdrone/{self.vehicle_type}_{self.vehicle_id}/planning/pos_cmd"
+            self.pos_cmd_sub = rospy.Subscriber(pos_cmd_topic, PositionCommand, self.pos_cmd_callback, queue_size=1)
+            rospy.logwarn(f"{self.vehicle_type}_{self.vehicle_id}: subscribed ego pos_cmd: {pos_cmd_topic}")
+        else:
+            rospy.logwarn(f"{self.vehicle_type}_{self.vehicle_id}: quadrotor_msgs/PositionCommand 不可用，无法订阅 ego pos_cmd")
+
         ''' 
         ros publishers
         '''
@@ -66,6 +80,7 @@ class Communication:
         self.set_param_srv = rospy.ServiceProxy(self.vehicle_type+'_'+self.vehicle_id+"/mavros/param/set", ParamSet)
         rcl_except = ParamValue(4, 0.0)
         self.set_param_srv("COM_RCL_EXCEPT", rcl_except)
+        self.enable_target_motion_pub = True
 
         print(self.vehicle_type+'_'+self.vehicle_id+": "+"communication initialized")
 
@@ -74,8 +89,10 @@ class Communication:
         main ROS thread
         '''
         while not rospy.is_shutdown():
-            self.target_motion.header.stamp = rospy.Time(0)
-            self.target_motion_pub.publish(self.target_motion)
+            # 仅在允许时才向 mavros/setpoint_raw/local 发布
+            if getattr(self, "enable_target_motion_pub", True):
+                self.target_motion.header.stamp = rospy.Time(0)
+                self.target_motion_pub.publish(self.target_motion)
             self.rate.sleep()
 
     def local_pose_callback(self, msg):
@@ -122,6 +139,9 @@ class Communication:
         return target_raw_pose
 
     def cmd_pose_flu_callback(self, msg):
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.coordinate_frame = 9
         self.motion_type = 0
         yaw = self.q2yaw(msg.orientation)
@@ -129,12 +149,18 @@ class Communication:
  
     def cmd_pose_enu_callback(self, msg):
         """位置指令回调函数"""
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.coordinate_frame = 1  # 位置指令坐标系
         self.motion_type = 0  # 位置控制模式
         yaw = self.q2yaw(msg.orientation)  # 将四元数转换为偏航角
         self.target_motion = self.construct_target(x=msg.position.x,y=msg.position.y,z=msg.position.z,yaw=yaw)
         
     def cmd_vel_flu_callback(self, msg):
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.hover_state_transition(msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z)
         if self.hover_flag == 0:
             self.coordinate_frame = 8
@@ -142,6 +168,9 @@ class Communication:
             self.target_motion = self.construct_target(vx=msg.linear.x,vy=msg.linear.y,vz=msg.linear.z,yaw_rate=msg.angular.z)  
  
     def cmd_vel_enu_callback(self, msg):
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.hover_state_transition(msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z)
         if self.hover_flag == 0:
             self.coordinate_frame = 1
@@ -149,6 +178,9 @@ class Communication:
             self.target_motion = self.construct_target(vx=msg.linear.x,vy=msg.linear.y,vz=msg.linear.z,yaw_rate=msg.angular.z)    
 
     def cmd_accel_flu_callback(self, msg):
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.hover_state_transition(msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z)
         if self.hover_flag == 0:
             self.coordinate_frame = 8
@@ -156,11 +188,38 @@ class Communication:
             self.target_motion = self.construct_target(ax=msg.linear.x,ay=msg.linear.y,az=msg.linear.z,yaw_rate=msg.angular.z)    
             
     def cmd_accel_enu_callback(self, msg):
+        # ego 接管时忽略环境/其它来源 cmd
+        if self._planner_active():
+            return
         self.hover_state_transition(msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z)
         if self.hover_flag == 0:
             self.coordinate_frame = 1 
             self.motion_type = 2
             self.target_motion = self.construct_target(ax=msg.linear.x,ay=msg.linear.y,az=msg.linear.z,yaw_rate=msg.angular.z)    
+
+    def pos_cmd_callback(self, msg):
+        """ego-planner 输出的 PositionCommand -> mavros raw setpoint"""
+        self._pos_cmd_last_stamp = rospy.Time.now()
+        # 使用 ENU 本地坐标
+        self.coordinate_frame = 1
+        sp = PositionTarget()
+        sp.header.stamp = rospy.Time(0)
+        sp.coordinate_frame = self.coordinate_frame
+        # 位置 + 速度 + yaw(+yaw_rate)，忽略加速度
+        sp.position.x = msg.position.x
+        sp.position.y = msg.position.y
+        sp.position.z = msg.position.z
+        sp.velocity.x = msg.velocity.x
+        sp.velocity.y = msg.velocity.y
+        sp.velocity.z = msg.velocity.z
+        sp.yaw = float(msg.yaw)
+        sp.yaw_rate = float(getattr(msg, "yaw_dot", 0.0))
+        sp.type_mask = (
+            PositionTarget.IGNORE_AFX
+            + PositionTarget.IGNORE_AFY
+            + PositionTarget.IGNORE_AFZ
+        )
+        self.target_motion = sp    
             
     def hover_state_transition(self,x,y,z,w):
         if abs(x) > 0.02 or abs(y)  > 0.02 or abs(z)  > 0.02 or abs(w)  > 0.005:
@@ -248,6 +307,13 @@ class Communication:
         else:
             print(self.vehicle_type+'_'+self.vehicle_id+": "+self.flight_mode+"failed")
             return False
+        
+    def _planner_active(self) -> bool:
+        """最近是否收到过 ego-planner 的 pos_cmd。"""
+        if self._pos_cmd_last_stamp == rospy.Time(0):
+            return False
+        return (rospy.Time.now() - self._pos_cmd_last_stamp) <= self.pos_cmd_timeout
+
 
 if __name__ == '__main__':
     rospy.init_node(sys.argv[1]+'_'+sys.argv[2]+"_communication")
