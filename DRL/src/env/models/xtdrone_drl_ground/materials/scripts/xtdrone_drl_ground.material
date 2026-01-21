@@ -1,0 +1,19 @@
+material XtDroneDrl/Ground
+{
+  technique
+  {
+    pass
+    {
+      ambient 0.80 0.80 0.80 1
+      diffuse 0.90 0.90 0.90 1
+      specular 0.02 0.02 0.02 1 8
+      
+      texture_unit
+      {
+        texture ground_checker.png
+        // 控制地面纹理“重复铺贴”的密度：值越大越细腻
+        scale 25 25
+      }
+    }
+  }
+}
