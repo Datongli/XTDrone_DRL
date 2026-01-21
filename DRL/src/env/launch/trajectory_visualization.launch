@@ -1,0 +1,31 @@
+<launch>
+  <!--
+    用法示例：
+      roslaunch env trajectory_visualization.launch uav_id:=0 frame_id:=map
+
+    说明：
+      - 默认订阅 /iris_0/mavros/vision_pose/pose
+      - 发布 /iris_0/trajectory/path 和 /iris_0/trajectory/marker
+      - 障碍物 Marker 由环境节点发布在 /static_obstacles
+  -->
+
+  <arg name="uav_id" default="0" />
+  <arg name="frame_id" default="map" />
+
+  <arg name="pose_topic" default="/iris_$(arg uav_id)/mavros/vision_pose/pose" />
+  <arg name="path_topic" default="/iris_$(arg uav_id)/trajectory/path" />
+  <arg name="marker_topic" default="/iris_$(arg uav_id)/trajectory/marker" />
+
+  <node pkg="env" type="trajectory_visualizer.py" name="trajectory_visualizer_$(arg uav_id)" output="screen">
+    <param name="frame_id" value="$(arg frame_id)" />
+    <param name="pose_topic" value="$(arg pose_topic)" />
+    <param name="path_topic" value="$(arg path_topic)" />
+    <param name="marker_topic" value="$(arg marker_topic)" />
+
+    <!-- 轨迹采样/观感参数（论文图一般用更稀疏一点 + 更细线） -->
+    <param name="min_dist" value="0.05" />
+    <param name="line_width" value="0.06" />
+    <param name="max_points" value="50000" />
+    <rosparam param="color_rgba">[1.0, 0.15, 0.15, 1.0]</rosparam>
+  </node>
+</launch>
