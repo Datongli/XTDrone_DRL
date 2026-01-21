@@ -16,13 +16,6 @@
         </material>
         <transparency>0.3</transparency>
       </visual>
-      <collision name="collision">
-        <geometry>
-          <sphere>
-            <radius>{radius}</radius>
-          </sphere>
-        </geometry>
-      </collision>
     </link>
   </model>
 </sdf>
