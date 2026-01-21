@@ -15,6 +15,13 @@
             <size>{size_x} {size_y} {size_z}</size>
           </box>
         </geometry>
+        <material>
+          <script>
+            <uri>model://xtdrone_drl_materials/materials/scripts</uri>
+            <uri>model://xtdrone_drl_materials/materials/textures</uri>
+            <name>{materialName}</name>
+          </script>
+        </material>
       </visual>
     </link>
   </model>
