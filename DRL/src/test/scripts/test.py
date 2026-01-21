@@ -49,7 +49,7 @@ def test(cfg) -> None:
     if navigationAlgorithm is None:
         raise ValueError(f"[测试] 未知算法类型: {algorithmType}")
     print(f"[测试] 使用算法: {algorithmType}")
-    env = StaticObstacleEnv(cfg)  # 导入环境
+    env = StaticObstacleEnv(cfg, mode="test")  # 导入环境并切换到测试模式
     if not bool(cfg_get(cfg, "gazebo.gui", False)):
         # 关闭gazebo headless客户端，防止渲染占用
         kill_gzclient()
