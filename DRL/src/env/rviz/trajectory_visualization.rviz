@@ -1,0 +1,66 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+
+Visualization Manager:
+  Class: ""
+  Name: root
+  Global Options:
+    Fixed Frame: map
+    Frame Rate: 30
+
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Plane: XY
+      Cell Size: 1
+      Plane Cell Count: 50
+      Color: 160; 160; 160
+      Alpha: 0.5
+
+    - Class: rviz/MarkerArray
+      Name: StaticObstacles
+      Enabled: true
+      Marker Topic: /static_obstacles
+      Queue Size: 10
+
+    - Class: rviz/MarkerArray
+      Name: Targets
+      Enabled: true
+      Marker Topic: /target
+      Queue Size: 10
+
+    - Class: rviz/Path
+      Name: Iris0Path
+      Enabled: true
+      Topic: /iris_0/trajectory/path
+      Queue Size: 10
+      Color: 41; 9; 246
+      Line Style: Billboards
+      Line Width: 0.5
+      Buffer Length: 1
+
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+
+  Current Tool: rviz/MoveCamera
+
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Name: Current View
+      Distance: 120
+      Focal Point: 50; 50; 10
+      Pitch: 0.8
+      Yaw: 0.8
