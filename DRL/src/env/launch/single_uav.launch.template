@@ -1,14 +1,20 @@
-  <launch>
+<launch>
     <arg name="map_size_x" value="{mapSizeX}"/>
     <arg name="map_size_y" value="{mapSizeY}"/>
     <arg name="map_size_z" value="{mapSizeZ}"/>
 
+    <!-- FIX: map 原点在 world 中的位置（与 python 的 offset 对齐） -->
+    <arg name="map_origin_x" value="{mapOriginX}"/>
+    <arg name="map_origin_y" value="{mapOriginY}"/>
+
     <arg name="odom_topic" value="vins_estimator/odometry" />
 
+    <!-- FIX: 让 world = map + (map_origin_x, map_origin_y, 0) -->
     <node pkg="tf" type="static_transform_publisher" name="iris_0_map_to_world"
-    args="0.0 0.0 0 0.0 0.0 0.0 /map /world 40" />
+          args="$(arg map_origin_x) $(arg map_origin_y) 0 0 0 0 /map /world 40" />
+
     <node pkg="tf" type="static_transform_publisher" name="iris_0_world_to_ground_plane"
-    args="0.0 0.0 0 0.0 0.0 0.0 /world /ground_plane 40" />
+          args="0.0 0.0 0 0.0 0.0 0.0 /world /ground_plane 40" />
 
     <include file="$(find ego_planner)/launch/run_in_xtdrone.launch">
         <arg name="drone_id" value="0"/>
@@ -21,8 +27,7 @@
         <arg name="map_size_y" value="$(arg map_size_y)"/>
         <arg name="map_size_z" value="$(arg map_size_z)"/>
         <arg name="odom_topic" value="$(arg odom_topic)"/>
+        <arg name="camera_pose_topic" value="/iris_0/camera_pose"/>
+        <arg name="depth_topic" value="/iris_0/realsense/depth_camera/depth/image_raw"/>
     </include>
-
-
-
-  </launch>
+</launch>
