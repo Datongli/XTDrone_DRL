@@ -1,5 +1,7 @@
 <?xml version="1.0"?>
 <launch>
+    <!-- 让 Gazebo 能找到 env/models 下的自定义模型与材质（model://xtdrone_drl_ground 等） -->
+    <env name="GAZEBO_MODEL_PATH" value="$(find env)/models:$(optenv GAZEBO_MODEL_PATH)"/>
     <!-- MAVROS posix SITL environment launch script -->
     <!-- launches Gazebo environment and 2x: MAVROS, PX4 SITL, and spawns vehicle -->
     <!-- vehicle model and world -->
