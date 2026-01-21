@@ -34,7 +34,7 @@ def test(cfg) -> None:
     """创建环境"""
     print("测试ego-planner算法效果")
     # 初始化环境
-    env = EGOPlannerEnv(cfg)
+    env = EGOPlannerEnv(cfg, mode="test")
     # 是否关闭gazebo的gui页面来加速
     if not bool(cfg_get(cfg, "gazebo.gui", False)):
         # 关闭gazebo headless客户端，防止渲染占用
